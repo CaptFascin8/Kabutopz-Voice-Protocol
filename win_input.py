@@ -72,12 +72,36 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 MAPVK_VK_TO_VSC = 0
 
+KEYEVENTF_UNICODE = 0x0004
+
+MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_ABSOLUTE = 0x8000
 WHEEL_DELTA = 120
+
+# GetSystemMetrics indices. The VIRTUALSCREEN family covers every monitor as
+# one rectangle; SM_CXSCREEN alone only describes the primary display, which
+# is the classic reason synthetic clicks land on the wrong monitor.
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+# GetDeviceCaps indices, used to detect Windows display scaling without
+# changing this process's DPI awareness.
+HORZRES = 8
+VERTRES = 10
+DESKTOPVERTRES = 117
+DESKTOPHORZRES = 118
 
 
 _VK_NAMES = {
@@ -167,6 +191,10 @@ _EXTENDED_KEYS = {
 }
 
 
+class POINT(ctypes.Structure):
+    _fields_ = (("x", wintypes.LONG), ("y", wintypes.LONG))
+
+
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.SendInput.argtypes = (
     wintypes.UINT,
@@ -192,6 +220,19 @@ _user32.GetMessageW.argtypes = (
     wintypes.UINT,
 )
 _user32.GetMessageW.restype = ctypes.c_int
+
+_user32.GetCursorPos.argtypes = (ctypes.POINTER(POINT),)
+_user32.GetCursorPos.restype = wintypes.BOOL
+_user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+_user32.GetSystemMetrics.restype = ctypes.c_int
+_user32.GetDC.argtypes = (wintypes.HWND,)
+_user32.GetDC.restype = wintypes.HDC
+_user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+_user32.ReleaseDC.restype = ctypes.c_int
+
+_gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+_gdi32.GetDeviceCaps.argtypes = (wintypes.HDC, ctypes.c_int)
+_gdi32.GetDeviceCaps.restype = ctypes.c_int
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
@@ -392,7 +433,12 @@ def release_keybind(parts):
         _key_event(part, key_up=True)
 
 
-def tap_keybind(keybind, tap_seconds=0.04):
+# "toggle quantum" (tap B) did nothing in game while "engage quantum"
+# (the same key held 1.2s) always worked. A 40ms press is under one frame
+# at 25fps, so the game's input poll can miss the whole event. 90ms
+# survives a bad frame and is still far below Star Citizen's tap/hold
+# threshold, so a tap is never mistaken for a hold.
+def tap_keybind(keybind, tap_seconds=0.09):
     parts = press_keybind(keybind)
     try:
         time.sleep(tap_seconds)
@@ -408,13 +454,13 @@ def hold_keybind(keybind, hold_seconds):
         release_keybind(parts)
 
 
-def _mouse_event(flags, data=0):
+def _mouse_event(flags, data=0, dx=0, dy=0):
     _send(
         INPUT(
             type=INPUT_MOUSE,
             mi=MOUSEINPUT(
-                dx=0,
-                dy=0,
+                dx=int(dx),
+                dy=int(dy),
                 mouseData=data,
                 dwFlags=flags,
                 time=0,
@@ -455,3 +501,280 @@ def tap_mouse_combo(keybind):
     finally:
         if pressed:
             release_keybind(pressed)
+
+
+# ---------------------------------------------------------------------------
+# Screen geometry, cursor position, and display scaling.
+#
+# Nothing here changes this process's DPI awareness on purpose. Making the
+# app DPI-aware would fix coordinate math but shrink the whole tkinter UI on
+# a scaled display, so instead we measure the scale factor and let callers
+# convert when they need physical pixels (for example when handing a capture
+# region to an external screenshot tool).
+# ---------------------------------------------------------------------------
+
+
+def screen_metrics(physical=False):
+    """Return the virtual desktop as ``(left, top, width, height)``.
+
+    The virtual desktop is the bounding rectangle of every monitor. On a
+    single-monitor machine this is just ``(0, 0, width, height)``.
+
+    By default this is the *logical* space Windows reports to this
+    DPI-unaware process — 1280x720 on a 4K display at 300% scaling. Pass
+    ``physical=True`` for real device pixels, which is the space
+    screenshots and OCR results live in.
+    """
+    left = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    top = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    width = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    height = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+
+    if width <= 0 or height <= 0:
+        # Fall back to the primary display if the virtual metrics are
+        # unavailable, which can happen on unusual driver setups.
+        left, top = 0, 0
+        width = _user32.GetSystemMetrics(SM_CXSCREEN)
+        height = _user32.GetSystemMetrics(SM_CYSCREEN)
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Could not determine the screen size.")
+
+    if physical:
+        scale_x, scale_y = dpi_scale()
+        return (
+            int(round(left * scale_x)),
+            int(round(top * scale_y)),
+            int(round(width * scale_x)),
+            int(round(height * scale_y)),
+        )
+
+    return left, top, width, height
+
+
+def to_physical(x, y):
+    """Convert logical (Windows-reported) coordinates to device pixels."""
+    scale_x, scale_y = dpi_scale()
+    return int(round(x * scale_x)), int(round(y * scale_y))
+
+
+def to_logical(x, y):
+    """Convert device pixels to logical (Windows-reported) coordinates."""
+    scale_x, scale_y = dpi_scale()
+    if scale_x == 0 or scale_y == 0:
+        return int(x), int(y)
+    return int(round(x / scale_x)), int(round(y / scale_y))
+
+
+def get_cursor_pos(physical=False):
+    """Return the mouse cursor position as ``(x, y)``.
+
+    Logical coordinates by default; ``physical=True`` returns device
+    pixels, matching what a screenshot would show.
+    """
+    point = POINT()
+    if not _user32.GetCursorPos(ctypes.byref(point)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if physical:
+        return to_physical(point.x, point.y)
+    return point.x, point.y
+
+
+def dpi_scale():
+    """Return ``(scale_x, scale_y)`` between reported and physical pixels.
+
+    Returns ``(1.0, 1.0)`` when Windows display scaling is off or when this
+    process is already DPI-aware. On a 4K display set to 150% scaling from a
+    DPI-unaware process this returns roughly ``(1.5, 1.5)``.
+    """
+    hdc = _user32.GetDC(None)
+    if not hdc:
+        return 1.0, 1.0
+    try:
+        logical_x = _gdi32.GetDeviceCaps(hdc, HORZRES)
+        logical_y = _gdi32.GetDeviceCaps(hdc, VERTRES)
+        physical_x = _gdi32.GetDeviceCaps(hdc, DESKTOPHORZRES)
+        physical_y = _gdi32.GetDeviceCaps(hdc, DESKTOPVERTRES)
+    finally:
+        _user32.ReleaseDC(None, hdc)
+
+    if logical_x <= 0 or logical_y <= 0:
+        return 1.0, 1.0
+    return physical_x / float(logical_x), physical_y / float(logical_y)
+
+
+def move_mouse_to(x, y, physical=False):
+    """Move the cursor to an absolute desktop position.
+
+    Coordinates are logical by default. Pass ``physical=True`` to use
+    device pixels, which is what screenshot measurements and OCR bounding
+    boxes are expressed in.
+
+    The normalization below is proportional, so it produces the same
+    result in either space as long as the point and the screen metrics
+    agree — which is exactly why both are read with the same flag.
+    """
+    left, top, width, height = screen_metrics(physical=physical)
+    if width < 2 or height < 2:
+        raise RuntimeError("Screen is too small to address absolutely.")
+
+    # SendInput absolute coordinates are normalized to 0-65535 across the
+    # whole virtual desktop, not measured in pixels.
+    norm_x = int(round((int(x) - left) * 65535.0 / (width - 1)))
+    norm_y = int(round((int(y) - top) * 65535.0 / (height - 1)))
+    norm_x = max(0, min(65535, norm_x))
+    norm_y = max(0, min(65535, norm_y))
+
+    _mouse_event(
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        0,
+        norm_x,
+        norm_y,
+    )
+
+
+def click_at(x, y, button="left", settle_seconds=0.06, physical=False):
+    """Move to ``(x, y)`` and click, giving the target time to hover-focus."""
+    move_mouse_to(x, y, physical=physical)
+    time.sleep(max(0.0, float(settle_seconds)))
+    click_mouse(button)
+
+
+# ---------------------------------------------------------------------------
+# Text entry.
+#
+# Scancodes first, because that is exactly how every keybind in this app is
+# already delivered and games are known to accept it. KEYEVENTF_UNICODE is
+# only used for characters with no scancode, since some games ignore it.
+# ---------------------------------------------------------------------------
+
+_TYPE_MAP = {}
+
+for _character in "abcdefghijklmnopqrstuvwxyz0123456789":
+    _TYPE_MAP[_character] = (_character, False)
+
+for _character in "abcdefghijklmnopqrstuvwxyz":
+    _TYPE_MAP[_character.upper()] = (_character, True)
+
+_TYPE_MAP[" "] = ("space", False)
+_TYPE_MAP["\t"] = ("tab", False)
+_TYPE_MAP["\n"] = ("enter", False)
+
+for _character in ";=,-./`[]\\'":
+    _TYPE_MAP[_character] = (_character, False)
+
+for _character, _base in {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+    "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\",
+    ":": ";", '"': "'", "<": ",", ">": ".", "?": "/", "~": "`",
+}.items():
+    _TYPE_MAP[_character] = (_base, True)
+
+del _character
+
+
+def type_unicode(text):
+    """Send characters as Unicode packets. Some games ignore these."""
+    for character in str(text):
+        for key_up in (False, True):
+            flags = KEYEVENTF_UNICODE
+            if key_up:
+                flags |= KEYEVENTF_KEYUP
+            _send(
+                INPUT(
+                    type=INPUT_KEYBOARD,
+                    ki=KEYBDINPUT(
+                        wVk=0,
+                        wScan=ord(character),
+                        dwFlags=flags,
+                        time=0,
+                        dwExtraInfo=0,
+                    ),
+                )
+            )
+
+
+def plan_typing(text, unicode_fallback=True):
+    """Turn ``text`` into the key events needed to type it.
+
+    Yields ``("shift", True/False)``, ``("key", name)`` and
+    ``("unicode", character)`` steps. Shift is raised once for a whole run of
+    characters that need it and lowered once afterwards, the way a person
+    types, and it is always lowered at the end.
+
+    Split out from :func:`type_text` purely so the sequencing can be tested
+    without a keyboard — the shift bug this fixes was invisible in code
+    review and only showed up as "HUR_L%" on screen.
+    """
+    shift = False
+    for character in str(text):
+        entry = _TYPE_MAP.get(character)
+
+        if entry is None:
+            if shift:
+                shift = False
+                yield ("shift", False)
+            if not unicode_fallback:
+                raise ValueError(f"Cannot type character: {character!r}")
+            yield ("unicode", character)
+            continue
+
+        key_name, needs_shift = entry
+        if needs_shift != shift:
+            shift = needs_shift
+            yield ("shift", shift)
+        yield ("key", key_name)
+
+    if shift:
+        yield ("shift", False)
+
+
+def type_text(text, interval=0.03, press_seconds=0.03, unicode_fallback=True,
+              shift_settle=0.02):
+    """Type ``text`` one character at a time.
+
+    ``interval`` is the pause between characters. Typing faster than about
+    0.02s per character tends to drop characters in game text fields.
+
+    Shift is **held across a run** of characters that all need it, and every
+    transition gets ``shift_settle`` on both sides. Typing "HUR-L5" into Star
+    Citizen used to produce "HUR_L%": each character toggled shift on its own,
+    and with only 12ms between shift down and shift up, two characters could
+    land inside one game frame and both get the same sampled shift state. The
+    unshifted "-" and "5" inherited the shift belonging to "R" and "L".
+
+    Holding shift the way a human does means far fewer transitions, and the
+    settle time keeps each one clear of its neighbours' key events.
+    """
+    shift_down = False
+
+    def set_shift(wanted):
+        nonlocal shift_down
+        if wanted == shift_down:
+            return
+        _key_event("left shift", key_up=not wanted)
+        shift_down = wanted
+        time.sleep(max(0.0, float(shift_settle)))
+
+    try:
+        for kind, value in plan_typing(text, unicode_fallback=unicode_fallback):
+            if kind == "shift":
+                set_shift(value)
+            elif kind == "unicode":
+                type_unicode(value)
+                time.sleep(max(0.0, float(interval)))
+            else:
+                _key_event(value)
+                time.sleep(max(0.0, float(press_seconds)))
+                _key_event(value, key_up=True)
+                time.sleep(max(0.0, float(interval)))
+    finally:
+        set_shift(False)
+
+
+def clear_text_field():
+    """Select-all then delete, for reusing a field that already has text."""
+    tap_keybind("ctrl+a")
+    time.sleep(0.05)
+    tap_keybind("delete")

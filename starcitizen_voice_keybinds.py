@@ -25,8 +25,18 @@ from pathlib import Path
 import sounddevice as sd
 import speech_recognition as sr
 
+import starmap as starmap_module
+import win_ocr
+
 from win_input import (
     GlobalHotkey,
+    click_at,
+    clear_text_field,
+    dpi_scale,
+    get_cursor_pos,
+    move_mouse_to,
+    screen_metrics,
+    type_text,
     hold_keybind,
     parse_global_hotkey,
     scroll_wheel,
@@ -50,7 +60,8 @@ COMMAND_MAX_CAPTURE_SECONDS = 2.6
 COMMAND_PREROLL_CHUNKS = 8
 PAGE_ORDER = (
     "VOICE PROTOCOL", "HOW TO", "CUSTOMIZE", "PHRASES", "KEYBINDS",
-    "CUSTOM WORDS", "COMPONENTS", "SHIP WEAPONS", "COMMODITIES", "MINING MODE", "SHIP FINDER",
+    "CUSTOM WORDS", "STAR MAP", "COMPONENTS", "SHIP WEAPONS",
+    "COMMODITIES", "MINING MODE", "SHIP FINDER",
     "GUIDES", "ANNOUNCEMENTS", "CREDIT",
 )
 
@@ -240,7 +251,9 @@ DEFAULT_PHRASES = {
         "previous weapon group", "last weapon group"
     ],
 
-    "open_inventory":        {"label": "Open Inventory",             "category": "On Foot - Utility",   "type": "tap",         "key": "i",                "hold": None},
+    # NOTE: an ACTIONS-shaped dict for "open_inventory" used to sit here. It was
+    # dead weight because the real phrase list below redefines the same key, but
+    # it would have silently broken phrase loading if that list were ever moved.
     "hide_chat": [
         "hide chat", "show chat", "toggle chat", "close chat"
     ],
@@ -284,6 +297,68 @@ THANK_YOU_COMPUTER_PHRASES = {
     "thank you robot",
     "thanks robot",
 }
+
+# ---------------------------------------------------------------------------
+# REPEATING ACTIONS
+# ---------------------------------------------------------------------------
+
+# Repeating any of these would be actively harmful, so they are refused even
+# if a phrase or a custom command asks for it.
+NEVER_REPEAT = {
+    "self_destruct",
+    "goon_mode",
+    "quit_star_citizen",
+}
+
+
+# ---------------------------------------------------------------------------
+# STAR MAP NAVIGATION
+# ---------------------------------------------------------------------------
+STARMAP_OPEN_PHRASES = (
+    "open star map", "open starmap", "open the star map",
+    "open the starmap", "star map mode", "navigation mode",
+)
+STARMAP_CLOSE_PHRASES = (
+    "close star map", "close starmap", "close the star map",
+    "exit map mode", "exit navigation mode",
+)
+STARMAP_ROUTE_PATTERN = re.compile(
+    r"\b(?:take me to|plot a course (?:to|for)|plot course (?:to|for)|"
+    r"set (?:a )?course (?:to|for)|navigate to|route to|fly to)\s+(?P<dest>.+)",
+    re.IGNORECASE,
+)
+STARMAP_SET_SYSTEM_PATTERN = re.compile(
+    r"\b(?:set (?:my )?system to|i am in|current system is)\s+(?P<system>.+)",
+    re.IGNORECASE,
+)
+STARMAP_WHICH_SYSTEM_PHRASES = (
+    "what system am i in", "which system am i in", "what star system am i in",
+    "where am i",
+)
+
+REPEAT_MIN_INTERVAL = 0.1
+REPEAT_MAX_INTERVAL = 3600.0
+REPEAT_DEFAULT_INTERVAL = 60.0
+
+# Spoken forms that stop every repeating action at once.
+REPEAT_STOP_ALL_PHRASES = {
+    "stop repeating",
+    "stop repeat",
+    "stop repeats",
+    "stop all repeats",
+    "cancel repeat",
+    "cancel repeats",
+    "cancel repeating",
+    "stop looping",
+    "stop the loop",
+}
+
+# "repeat that" / "repeat that every 30 seconds" — repeats the last action run.
+REPEAT_LAST_PATTERN = re.compile(
+    r"\brepeat\s+(?:that|it|the\s+last\s+(?:command|action))"
+    r"(?:\s+every\s+(?P<amount>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m)\b)?"
+)
 
 THANK_YOU_COMPUTER_RESPONSES = (
     "You're welcome.",
@@ -455,6 +530,148 @@ THEME_PRESETS = {
 LEGACY_DEFAULT_THEME = THEME_PRESETS["Midnight Blue"].copy()
 DEFAULT_THEME = THEME_PRESETS["Industrial Orange"].copy()
 
+def clamp_repeat_interval(value, fallback=REPEAT_DEFAULT_INTERVAL):
+    """Coerce any user-supplied interval into a safe number of seconds."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if seconds != seconds:  # NaN
+        return float(fallback)
+    return max(REPEAT_MIN_INTERVAL, min(REPEAT_MAX_INTERVAL, seconds))
+
+
+class RepeatController:
+    """Runs actions on a timer until something stops them.
+
+    Every repeat gets its own daemon thread waiting on a ``threading.Event``
+    rather than sleeping, so a stop request takes effect immediately instead
+    of waiting out the rest of a 60 second interval.
+
+    Repeats deliberately do not run on the listen loop's thread. Doing that
+    would block speech recognition for the whole duration, which would make
+    it impossible to say "I'm back" and be heard.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._lock = threading.Lock()
+        self._jobs = {}  # action_id -> {"thread", "stop", "interval", "label"}
+
+    # ---- queries -------------------------------------------------------
+    def is_active(self, action_id):
+        with self._lock:
+            return action_id in self._jobs
+
+    def active_jobs(self):
+        """Return ``[(action_id, label, interval), ...]`` for the UI."""
+        with self._lock:
+            return [
+                (action_id, job["label"], job["interval"])
+                for action_id, job in sorted(self._jobs.items())
+            ]
+
+    def count(self):
+        with self._lock:
+            return len(self._jobs)
+
+    # ---- control -------------------------------------------------------
+    def start(self, action_id, label, action_type, key, hold, interval):
+        """Begin repeating an action. Restarts it if already running."""
+        if action_id in NEVER_REPEAT:
+            raise ValueError(f"{label} cannot be repeated.")
+
+        interval = clamp_repeat_interval(interval)
+        self.stop(action_id, announce=False)
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._run,
+            args=(action_id, label, action_type, key, hold, interval, stop_event),
+            name=f"KabutopzRepeat-{action_id}",
+            daemon=True,
+        )
+
+        with self._lock:
+            self._jobs[action_id] = {
+                "thread": thread,
+                "stop": stop_event,
+                "interval": interval,
+                "label": label,
+            }
+
+        thread.start()
+        return interval
+
+    def stop(self, action_id, announce=True):
+        """Stop one repeating action. Returns its label, or None."""
+        with self._lock:
+            job = self._jobs.pop(action_id, None)
+
+        if job is None:
+            return None
+
+        job["stop"].set()
+        if announce:
+            self.app.events.put((
+                "repeat_stop",
+                f"Repeat stopped: {job['label']}",
+            ))
+        return job["label"]
+
+    def stop_all(self, announce=True):
+        """Stop everything. Returns the number of repeats that were running."""
+        with self._lock:
+            jobs = list(self._jobs.items())
+            self._jobs.clear()
+
+        for _, job in jobs:
+            job["stop"].set()
+
+        if jobs and announce:
+            self.app.events.put((
+                "repeat_stop",
+                f"Stopped {len(jobs)} repeating action(s).",
+            ))
+        return len(jobs)
+
+    # ---- worker --------------------------------------------------------
+    def _run(self, action_id, label, action_type, key, hold, interval, stop_event):
+        ticks = 0
+        last_logged = 0.0
+
+        try:
+            while not stop_event.is_set():
+                try:
+                    self.app._run_action(action_type, key, hold)
+                    ticks += 1
+                except Exception as exc:
+                    self.app.events.put((
+                        "error",
+                        f"Repeat '{label}' failed on '{key}': {exc}",
+                    ))
+                    break
+
+                # Log the first tick, then at most one line every 30 seconds,
+                # so an hour-long AFK repeat does not bury the history panel.
+                now = time.monotonic()
+                if ticks == 1 or now - last_logged >= 30.0:
+                    last_logged = now
+                    self.app.events.put((
+                        "repeat_tick",
+                        f"{label} → {key} (repeat #{ticks}, every {interval:g}s)",
+                    ))
+
+                if stop_event.wait(interval):
+                    break
+        finally:
+            with self._lock:
+                job = self._jobs.get(action_id)
+                if job is not None and job["stop"] is stop_event:
+                    self._jobs.pop(action_id, None)
+            self.app.events.put(("repeat_changed", ""))
+
+
 class VoiceKeybindApp(tk.Tk):
     RED = "#ff5d6c"
 
@@ -479,6 +696,15 @@ class VoiceKeybindApp(tk.Tk):
         self.worker = None
         self.events = queue.Queue()
         self.last_triggered = {}
+        self.repeats = RepeatController(self)
+        # Star map automation. Its log callback goes through the event queue
+        # rather than touching tk directly, because route_to() runs on a
+        # worker thread — a 10-15 second sequence that must not block
+        # speech recognition.
+        self.starmap = None
+        self.starmap_busy = threading.Lock()
+        # (action_id) of the most recent match, so "repeat that" has a referent.
+        self.last_action = None
         self.recognizer = sr.Recognizer()
         self.audio_devices = []
         self.selected_device = "__default__"
@@ -500,6 +726,7 @@ class VoiceKeybindApp(tk.Tk):
         self._load_custom_actions_into_registry()
         self.phrases = self._load_phrases()
         self.keybinds = self._load_keybinds()
+        self._create_starmap_controller()
 
         self.tracked = {
             "bg": [], "panel": [], "panel2": [], "text": [],
@@ -523,6 +750,7 @@ class VoiceKeybindApp(tk.Tk):
         self._build_phrases_page()
         self._build_custom_words_page()
         self._build_keybinds_page()
+        self._build_starmap_page()
         self._build_mining_page()
         self._build_ship_finder_page()
         self._build_guides_page()
@@ -557,6 +785,8 @@ class VoiceKeybindApp(tk.Tk):
             "keybinds": {},
             "custom_actions": [],
             "phrases": DEFAULT_PHRASES.copy(),
+            "repeat_defaults": {"interval": REPEAT_DEFAULT_INTERVAL},
+            "starmap": {},
         }
 
     def _load_theme(self):
@@ -604,6 +834,21 @@ class VoiceKeybindApp(tk.Tk):
                 "key": key,
                 "hold": hold,
                 "custom": True,
+                # Repeat settings live on the action so the listen loop can
+                # read them without going back to the saved record.
+                "repeat": bool(item.get("repeat", False)),
+                "repeat_interval": clamp_repeat_interval(
+                    item.get("repeat_interval", REPEAT_DEFAULT_INTERVAL)
+                ),
+                "repeat_cancel_phrases": self._clean_phrase_list(
+                    item.get("repeat_cancel_phrases", [])
+                ),
+                "repeat_cancel_response": str(
+                    item.get("repeat_cancel_response", "")
+                ).strip(),
+                "repeat_start_response": str(
+                    item.get("repeat_start_response", "")
+                ).strip(),
             }
 
             phrases = item.get("phrases", [])
@@ -613,6 +858,21 @@ class VoiceKeybindApp(tk.Tk):
                     for p in phrases
                     if str(p).strip()
                 ]
+
+    @staticmethod
+    def _clean_phrase_list(value):
+        """Normalize a comma-or-newline separated phrase list from settings."""
+        if isinstance(value, str):
+            value = re.split(r"[,\n]", value)
+        if not isinstance(value, (list, tuple)):
+            return []
+
+        cleaned = []
+        for item in value:
+            phrase = str(item).strip().lower().strip(" ,.!?-")
+            if phrase and phrase not in cleaned:
+                cleaned.append(phrase)
+        return cleaned
 
     def _load_phrases(self):
         saved = self.settings.get("phrases", {})
@@ -646,6 +906,13 @@ class VoiceKeybindApp(tk.Tk):
             self.settings["phrases"] = self.phrases
             self.settings["keybinds"] = self.keybinds
             self.settings["custom_actions"] = self.custom_actions
+            self._save_starmap_settings()
+            if hasattr(self, "repeat_default_var"):
+                self.settings["repeat_defaults"] = {
+                    "interval": clamp_repeat_interval(
+                        self.repeat_default_var.get()
+                    ),
+                }
             SETTINGS_FILE.write_text(
                 json.dumps(self.settings, indent=2),
                 encoding="utf-8"
@@ -709,6 +976,62 @@ class VoiceKeybindApp(tk.Tk):
         for kind in kinds:
             self.tracked[kind].append(widget)
         return widget
+
+    def _scrollable(self, parent, pad_x=28, pad_y=24):
+        """Return a frame that scrolls vertically inside ``parent``.
+
+        Some pages are taller than the window, and content below the fold is
+        simply unreachable — the CUSTOM WORDS page lost its CREATE button
+        this way once the repeat controls were added. Wrapping the content in
+        a canvas keeps every control reachable at any window size.
+        """
+        t = self.theme
+
+        holder = self._track(tk.Frame(parent, bg=t["panel"]), "panel")
+        holder.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(
+            holder, bg=t["panel"], highlightthickness=0, bd=0,
+        )
+        canvas.pack(side="left", fill="both", expand=True)
+        self._track(canvas, "panel")
+
+        scrollbar = ttk.Scrollbar(
+            holder, orient="vertical", command=canvas.yview
+        )
+        scrollbar.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        inner = self._track(tk.Frame(canvas, bg=t["panel"]), "panel")
+        window = canvas.create_window(
+            (pad_x, pad_y), window=inner, anchor="nw"
+        )
+
+        def _content_resized(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _canvas_resized(event):
+            # Keep the content the width of the viewport so nothing is cut
+            # off horizontally, leaving room for the padding on both sides.
+            canvas.itemconfigure(window, width=max(1, event.width - pad_x * 2))
+
+        inner.bind("<Configure>", _content_resized)
+        canvas.bind("<Configure>", _canvas_resized)
+
+        def _wheel(event):
+            # Only scroll when there is something to scroll to, so the wheel
+            # still reaches nested lists that manage their own scrolling.
+            first, last = canvas.yview()
+            if first <= 0.0 and last >= 1.0:
+                return
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind(
+            "<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel)
+        )
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        return inner
 
     def _walk_widgets(self, parent=None):
         """Yield every existing UI widget so theme changes are comprehensive."""
@@ -1098,6 +1421,7 @@ class VoiceKeybindApp(tk.Tk):
             "PHRASES": "PHRASES",
             "KEYBINDS": "KEYBINDS",
             "CUSTOM WORDS": "CUSTOM WORDS",
+            "STAR MAP": "STAR MAP",
             "COMMODITIES": "COMMODITIES",
             "COMPONENTS": "COMPONENTS",
             "SHIP WEAPONS": "SHIP WEAPONS",
@@ -1109,7 +1433,7 @@ class VoiceKeybindApp(tk.Tk):
         }
         for page_name in PAGE_ORDER:
             tab = tk.Button(
-                page_tabs, text=tab_labels[page_name],
+                page_tabs, text=tab_labels.get(page_name, page_name),
                 command=lambda name=page_name: self.show_page(name),
                 bg=t["panel2"], fg=t["text"],
                 activebackground=t["border"], activeforeground=t["text"],
@@ -1138,6 +1462,7 @@ class VoiceKeybindApp(tk.Tk):
             self.phrases_page,
             self.custom_words_page,
             self.keybinds_page,
+            self.starmap_page,
             self.mining_page,
             self.ship_finder_page,
             self.guides_page,
@@ -1155,6 +1480,7 @@ class VoiceKeybindApp(tk.Tk):
             "PHRASES": self.phrases_page,
             "CUSTOM WORDS": self.custom_words_page,
             "KEYBINDS": self.keybinds_page,
+            "STAR MAP": self.starmap_page,
             "MINING MODE": self.mining_page,
             "SHIP FINDER": self.ship_finder_page,
             "GUIDES": self.guides_page,
@@ -1479,6 +1805,76 @@ class VoiceKeybindApp(tk.Tk):
             muted=True,
         )
         self.mic_label.pack(anchor="w", padx=18, pady=(0, 14))
+
+        # ---- active repeats ----
+        self._label(
+            control, "ACTIVE REPEATS", ("Segoe UI", 8, "bold"), muted=True
+        ).pack(anchor="w", padx=18, pady=(0, 5))
+
+        self.repeat_list = tk.Listbox(
+            control,
+            height=4,
+            bg=t["panel2"], fg=t["text"],
+            selectbackground=t["border"],
+            selectforeground=t["text"],
+            relief="flat", bd=0,
+            activestyle="none",
+            font=("Cascadia Mono", 8),
+            highlightthickness=0,
+        )
+        self.repeat_list.pack(fill="x", padx=18)
+
+        repeat_buttons = self._track(tk.Frame(control, bg=t["panel"]), "panel")
+        repeat_buttons.pack(fill="x", padx=18, pady=(6, 6))
+
+        stop_selected_repeat = tk.Button(
+            repeat_buttons,
+            text="STOP SELECTED",
+            command=self._stop_selected_repeat,
+            bg=t["panel2"], fg=t["text"],
+            activebackground=t["border"], activeforeground=t["text"],
+            relief="flat", bd=0,
+            font=("Segoe UI", 8, "bold"), pady=6,
+        )
+        self._track(stop_selected_repeat, "panel2", "text")
+        stop_selected_repeat.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        stop_all_repeats = tk.Button(
+            repeat_buttons,
+            text="STOP ALL",
+            command=self._stop_all_repeats,
+            bg=self.RED, fg="#0b0f14",
+            activebackground=self.RED, activeforeground="#0b0f14",
+            relief="flat", bd=0,
+            font=("Segoe UI", 8, "bold"), pady=6,
+        )
+        stop_all_repeats.pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        default_repeat_row = self._track(tk.Frame(control, bg=t["panel"]), "panel")
+        default_repeat_row.pack(fill="x", padx=18, pady=(0, 14))
+
+        self._label(
+            default_repeat_row, 'DEFAULT "REPEAT THAT" INTERVAL',
+            ("Segoe UI", 8), muted=True
+        ).pack(side="left", padx=(0, 8))
+
+        saved_repeat = self.settings.get("repeat_defaults", {})
+        self.repeat_default_var = tk.StringVar(
+            value=f"{clamp_repeat_interval(saved_repeat.get('interval')):g}"
+        )
+        self.repeat_default_spin = ttk.Spinbox(
+            default_repeat_row,
+            textvariable=self.repeat_default_var,
+            from_=REPEAT_MIN_INTERVAL,
+            to=REPEAT_MAX_INTERVAL,
+            increment=1.0,
+            width=8,
+            style="Dark.TCombobox",
+            command=self._save_settings,
+        )
+        self.repeat_default_spin.pack(side="left")
+
+        self._refresh_repeat_list()
 
         catalog = self._panel(right)
         catalog.pack(fill="both", expand=True)
@@ -2398,8 +2794,7 @@ class VoiceKeybindApp(tk.Tk):
         panel = self._panel(self.custom_words_page)
         panel.pack(fill="both", expand=True)
 
-        inner = self._track(tk.Frame(panel, bg=t["panel"]), "panel")
-        inner.pack(fill="both", expand=True, padx=28, pady=24)
+        inner = self._scrollable(panel)
 
         self._label(
             inner, "CUSTOM WORDS", ("Segoe UI", 18, "bold")
@@ -2512,6 +2907,76 @@ class VoiceKeybindApp(tk.Tk):
             relief="flat", bd=0, font=("Cascadia Mono", 9)
         )
         self.custom_hold_entry.pack(side="left", ipady=5)
+        # ---- repeat configuration ----
+        repeat_row = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        repeat_row.pack(fill="x", pady=(0, 10))
+
+        self.custom_repeat_var = tk.BooleanVar(value=False)
+        repeat_check = tk.Checkbutton(
+            repeat_row,
+            text="REPEAT THIS COMMAND",
+            variable=self.custom_repeat_var,
+            bg=t["panel"], fg=t["text"],
+            selectcolor=t["panel2"],
+            activebackground=t["panel"], activeforeground=t["text"],
+            font=("Segoe UI", 8, "bold"),
+        )
+        repeat_check.pack(side="left", padx=(0, 12))
+
+        self._label(
+            repeat_row, "EVERY (SECONDS)", ("Segoe UI", 8, "bold"), muted=True
+        ).pack(side="left", padx=(0, 8))
+
+        self.custom_repeat_interval_var = tk.StringVar(
+            value=f"{REPEAT_DEFAULT_INTERVAL:g}"
+        )
+        self.custom_repeat_interval_spin = ttk.Spinbox(
+            repeat_row,
+            textvariable=self.custom_repeat_interval_var,
+            from_=REPEAT_MIN_INTERVAL,
+            to=REPEAT_MAX_INTERVAL,
+            increment=1.0,
+            width=10,
+            style="Dark.TCombobox",
+        )
+        self.custom_repeat_interval_spin.pack(side="left")
+
+        cancel_form = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        cancel_form.pack(fill="x", pady=(0, 12))
+
+        self._label(
+            cancel_form,
+            'STOP PHRASES — comma separated, e.g.  i\'m back, im back',
+            ("Segoe UI", 8, "bold"), muted=True
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 5))
+        self._label(
+            cancel_form,
+            'SPOKEN REPLY WHEN STOPPED — e.g.  Welcome back.',
+            ("Segoe UI", 8, "bold"), muted=True
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0), pady=(0, 5))
+
+        self.custom_repeat_cancel_var = tk.StringVar()
+        self.custom_repeat_cancel_entry = tk.Entry(
+            cancel_form, textvariable=self.custom_repeat_cancel_var,
+            bg=t["panel2"], fg=t["text"], insertbackground=t["text"],
+            relief="flat", bd=0, font=("Cascadia Mono", 10)
+        )
+        self.custom_repeat_cancel_entry.grid(
+            row=1, column=0, sticky="ew", padx=(0, 8), ipady=8
+        )
+
+        self.custom_repeat_reply_var = tk.StringVar()
+        self.custom_repeat_reply_entry = tk.Entry(
+            cancel_form, textvariable=self.custom_repeat_reply_var,
+            bg=t["panel2"], fg=t["text"], insertbackground=t["text"],
+            relief="flat", bd=0, font=("Cascadia Mono", 10)
+        )
+        self.custom_repeat_reply_entry.grid(
+            row=1, column=1, sticky="ew", padx=(8, 0), ipady=8
+        )
+
+        cancel_form.grid_columnconfigure(0, weight=1)
+        cancel_form.grid_columnconfigure(1, weight=1)
 
         self._label(
             inner, "CUSTOM PHRASES — CHECKED PHRASES WILL BE ACTIVE",
@@ -2541,10 +3006,12 @@ class VoiceKeybindApp(tk.Tk):
         addbtn.pack(side="left", padx=(10, 0))
 
         checklist_outer = self._track(tk.Frame(inner, bg=t["panel2"]), "panel2")
-        checklist_outer.pack(fill="both", expand=True, pady=(10, 10))
+        checklist_outer.pack(fill="x", pady=(10, 10))
 
+        # Explicit height: inside the scrolling page there is no fixed
+        # viewport for expand=True to fill, so the list would collapse.
         self.custom_phrase_canvas = tk.Canvas(
-            checklist_outer, bg=t["panel2"], highlightthickness=0
+            checklist_outer, bg=t["panel2"], highlightthickness=0, height=170
         )
         self.custom_phrase_canvas.pack(side="left", fill="both", expand=True)
 
@@ -2731,6 +3198,10 @@ class VoiceKeybindApp(tk.Tk):
         self.custom_modifier_side_var.set("Standard")
         self.custom_type_var.set("tap")
         self.custom_hold_var.set("1.0")
+        self.custom_repeat_var.set(False)
+        self.custom_repeat_interval_var.set(f"{REPEAT_DEFAULT_INTERVAL:g}")
+        self.custom_repeat_cancel_var.set("")
+        self.custom_repeat_reply_var.set("")
         self.custom_phrase_var.set("")
         for row in list(self.custom_phrase_rows):
             try:
@@ -2781,6 +3252,25 @@ class VoiceKeybindApp(tk.Tk):
                 messagebox.showerror("Custom Words", "Hold seconds must be a positive number.")
                 return
 
+        repeat_enabled = bool(self.custom_repeat_var.get())
+        repeat_interval = clamp_repeat_interval(
+            self.custom_repeat_interval_var.get()
+        )
+        cancel_phrases = self._clean_phrase_list(
+            self.custom_repeat_cancel_var.get()
+        )
+        cancel_reply = self.custom_repeat_reply_var.get().strip()
+
+        if repeat_enabled and not cancel_phrases:
+            if not messagebox.askyesno(
+                "Repeat Without A Stop Phrase",
+                f"{label} will repeat every {repeat_interval:g} seconds with no "
+                f"stop phrase of its own.\n\n"
+                f"You can still stop it by saying \"stop repeating\" or from the "
+                f"ACTIVE REPEATS panel.\n\nCreate it anyway?"
+            ):
+                return
+
         action_id = self._slugify_custom_action(label)
         record = {
             "id": action_id,
@@ -2790,6 +3280,11 @@ class VoiceKeybindApp(tk.Tk):
             "type": action_type,
             "hold": hold,
             "phrases": phrases,
+            "repeat": repeat_enabled,
+            "repeat_interval": repeat_interval,
+            "repeat_cancel_phrases": cancel_phrases,
+            "repeat_cancel_response": cancel_reply,
+            "repeat_start_response": "",
         }
 
         self.custom_actions.append(record)
@@ -2800,6 +3295,11 @@ class VoiceKeybindApp(tk.Tk):
             "key": key,
             "hold": hold,
             "custom": True,
+            "repeat": repeat_enabled,
+            "repeat_interval": repeat_interval,
+            "repeat_cancel_phrases": cancel_phrases,
+            "repeat_cancel_response": cancel_reply,
+            "repeat_start_response": "",
         }
         DEFAULT_PHRASES[action_id] = list(phrases)
         self.phrases[action_id] = list(phrases)
@@ -2928,6 +3428,12 @@ class VoiceKeybindApp(tk.Tk):
             item for item in self.custom_actions
             if item.get("id") != action_id
         ]
+        # Stop it first — a repeat thread outliving its own action would keep
+        # sending a keybind nothing in the UI can cancel any more.
+        self.repeats.stop(action_id, announce=False)
+        if self.last_action == action_id:
+            self.last_action = None
+
         ACTIONS.pop(action_id, None)
         DEFAULT_PHRASES.pop(action_id, None)
         self.phrases.pop(action_id, None)
@@ -3861,6 +4367,329 @@ class VoiceKeybindApp(tk.Tk):
         return page
 
 
+    # -------------------- STAR MAP page --------------------
+    def _build_starmap_page(self):
+        t = self.theme
+        self.starmap_page = self._track(
+            tk.Frame(self.page_host, bg=t["bg"]), "bg"
+        )
+
+        panel = self._panel(self.starmap_page)
+        panel.pack(fill="both", expand=True)
+
+        inner = self._scrollable(panel)
+
+        self._label(inner, "STAR MAP", ("Segoe UI", 18, "bold")).pack(anchor="w")
+        self._label(
+            inner,
+            'Say "open star map", then "take me to Grim Hex" or "plot a course '
+            'to Pyro Gateway". The course is verified before it is confirmed.',
+            ("Segoe UI", 9), muted=True
+        ).pack(anchor="w", pady=(4, 16))
+
+        # ---- search bar position ----
+        pos = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        pos.pack(fill="x", pady=(0, 12))
+
+        self._label(
+            pos, "SEARCH BAR POSITION (SCREEN PIXELS)",
+            ("Segoe UI", 8, "bold"), muted=True
+        ).pack(anchor="w", pady=(0, 5))
+
+        posrow = self._track(tk.Frame(pos, bg=t["panel"]), "panel")
+        posrow.pack(fill="x")
+
+        self.starmap_x_var = tk.StringVar(
+            value=str(self.starmap.settings["search_x"])
+        )
+        self.starmap_y_var = tk.StringVar(
+            value=str(self.starmap.settings["search_y"])
+        )
+
+        for label, var in (("X", self.starmap_x_var), ("Y", self.starmap_y_var)):
+            self._label(posrow, label, ("Segoe UI", 8, "bold"), muted=True).pack(
+                side="left", padx=(0, 6)
+            )
+            entry = tk.Entry(
+                posrow, textvariable=var, width=8,
+                bg=t["panel2"], fg=t["text"], insertbackground=t["text"],
+                relief="flat", bd=0, font=("Cascadia Mono", 10),
+            )
+            entry.pack(side="left", ipady=6, padx=(0, 14))
+
+        capture = tk.Button(
+            posrow, text="CAPTURE POSITION (5s)",
+            command=self._starmap_capture_position,
+            bg=t["accent"], fg="#07111c",
+            activebackground=t["accent"], activeforeground="#07111c",
+            relief="flat", bd=0, font=("Segoe UI", 8, "bold"),
+            padx=14, pady=7,
+        )
+        capture.pack(side="left", padx=(0, 8))
+
+        save_pos = tk.Button(
+            posrow, text="SAVE",
+            command=self._starmap_save_position,
+            bg=t["panel2"], fg=t["text"],
+            activebackground=t["border"], activeforeground=t["text"],
+            relief="flat", bd=0, font=("Segoe UI", 8, "bold"),
+            padx=14, pady=7,
+        )
+        self._track(save_pos, "panel2", "text")
+        save_pos.pack(side="left")
+
+        self.starmap_capture_label = self._label(
+            pos, "Hover the mouse over the search bar, then it records where it is.",
+            ("Segoe UI", 8), muted=True
+        )
+        self.starmap_capture_label.pack(anchor="w", pady=(6, 0))
+
+        # ---- system + toggles ----
+        sysrow = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        sysrow.pack(fill="x", pady=(0, 12))
+
+        self._label(
+            sysrow, "CURRENT SYSTEM", ("Segoe UI", 8, "bold"), muted=True
+        ).pack(side="left", padx=(0, 8))
+
+        self.starmap_system_var = tk.StringVar(
+            value=self.starmap.current_system
+        )
+        self.starmap_system_combo = ttk.Combobox(
+            sysrow, textvariable=self.starmap_system_var,
+            values=["Stanton", "Pyro", "Nyx", "Terra", "Castra"],
+            state="normal", style="Dark.TCombobox", width=14,
+        )
+        self.starmap_system_combo.pack(side="left", padx=(0, 16))
+        self.starmap_system_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._starmap_apply_toggles()
+        )
+
+        self.starmap_autodetect_var = tk.BooleanVar(
+            value=bool(self.starmap.settings["auto_detect_system"])
+        )
+        auto_check = tk.Checkbutton(
+            sysrow, text="DETECT FROM MAP",
+            variable=self.starmap_autodetect_var,
+            command=self._starmap_apply_toggles,
+            bg=t["panel"], fg=t["text"], selectcolor=t["panel2"],
+            activebackground=t["panel"], activeforeground=t["text"],
+            font=("Segoe UI", 8, "bold"),
+        )
+        auto_check.pack(side="left", padx=(0, 12))
+
+        self.starmap_block_var = tk.BooleanVar(
+            value=bool(self.starmap.settings["block_cross_system"])
+        )
+        block_check = tk.Checkbutton(
+            sysrow, text="WARN ON CROSS-SYSTEM",
+            variable=self.starmap_block_var,
+            command=self._starmap_apply_toggles,
+            bg=t["panel"], fg=t["text"], selectcolor=t["panel2"],
+            activebackground=t["panel"], activeforeground=t["text"],
+            font=("Segoe UI", 8, "bold"),
+        )
+        block_check.pack(side="left", padx=(0, 12))
+
+        self.starmap_verify_var = tk.BooleanVar(
+            value=bool(self.starmap.settings["verify_route"])
+        )
+        verify_check = tk.Checkbutton(
+            sysrow, text="VERIFY COURSE",
+            variable=self.starmap_verify_var,
+            command=self._starmap_apply_toggles,
+            bg=t["panel"], fg=t["text"], selectcolor=t["panel2"],
+            activebackground=t["panel"], activeforeground=t["text"],
+            font=("Segoe UI", 8, "bold"),
+        )
+        verify_check.pack(side="left")
+
+        # ---- timing ----
+        self._label(
+            inner, "TIMING (SECONDS) — RAISE IF THE GAME IS SLOW TO RESPOND",
+            ("Segoe UI", 8, "bold"), muted=True
+        ).pack(anchor="w", pady=(0, 5))
+
+        timing = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        timing.pack(fill="x", pady=(0, 14))
+
+        self.starmap_delay_vars = {}
+        for key, label in (
+            ("delay_click", "CLICK SETTLE"),
+            ("delay_type", "AFTER TYPING"),
+            ("delay_select", "AFTER SELECT"),
+            ("delay_route", "AFTER R"),
+        ):
+            self._label(
+                timing, label, ("Segoe UI", 8), muted=True
+            ).pack(side="left", padx=(0, 6))
+            var = tk.StringVar(value=f"{self.starmap.settings[key]:g}")
+            self.starmap_delay_vars[key] = var
+            spin = ttk.Spinbox(
+                timing, textvariable=var, from_=0.0, to=10.0,
+                increment=0.1, width=6, style="Dark.TCombobox",
+                command=self._starmap_apply_toggles,
+            )
+            spin.pack(side="left", padx=(0, 16))
+
+        # ---- test + status ----
+        testrow = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        testrow.pack(fill="x", pady=(0, 10))
+
+        self._label(
+            testrow, "TEST DESTINATION", ("Segoe UI", 8, "bold"), muted=True
+        ).pack(side="left", padx=(0, 8))
+
+        self.starmap_test_var = tk.StringVar(value="Grim Hex")
+        test_entry = tk.Entry(
+            testrow, textvariable=self.starmap_test_var,
+            bg=t["panel2"], fg=t["text"], insertbackground=t["text"],
+            relief="flat", bd=0, font=("Cascadia Mono", 10),
+        )
+        test_entry.pack(side="left", fill="x", expand=True, ipady=6,
+                        padx=(0, 10))
+
+        test_btn = tk.Button(
+            testrow, text="TEST ROUTE",
+            command=self._starmap_test_route,
+            bg=t["accent"], fg="#07111c",
+            activebackground=t["accent"], activeforeground="#07111c",
+            relief="flat", bd=0, font=("Segoe UI", 8, "bold"),
+            padx=18, pady=7,
+        )
+        test_btn.pack(side="left")
+
+        self.starmap_status_label = self._label(
+            inner, "Checking Windows OCR...", ("Segoe UI", 8), muted=True
+        )
+        self.starmap_status_label.pack(anchor="w", pady=(4, 0))
+
+        self._label(
+            inner,
+            "VOICE COMMANDS", ("Segoe UI", 8, "bold"), muted=True
+        ).pack(anchor="w", pady=(14, 5))
+
+        help_text = (
+            '  "open star map"                      F2, then focus the search bar\n'
+            '  "take me to Grim Hex"                search, select, route, verify\n'
+            '  "plot a course to Pyro Gateway"      same thing, different wording\n'
+            '  "set system to Pyro"                 override the detected system\n'
+            '  "what system am I in"                read it back\n'
+            '  "close star map"                     F2 again'
+        )
+        help_box = tk.Label(
+            inner, text=help_text, justify="left", anchor="w",
+            bg=t["panel2"], fg=t["muted"],
+            font=("Cascadia Mono", 9), padx=14, pady=12,
+        )
+        self._track(help_box, "panel2", "muted")
+        help_box.pack(fill="x")
+
+        threading.Thread(
+            target=self._starmap_check_ocr, daemon=True
+        ).start()
+
+    def _starmap_check_ocr(self):
+        try:
+            available, description = win_ocr.ocr_status()
+        except Exception as exc:
+            available, description = False, f"OCR check failed: {exc}"
+        self.events.put(("starmap_ocr", (available, description)))
+
+    def _refresh_starmap_page(self):
+        if not hasattr(self, "starmap_system_var") or self.starmap is None:
+            return
+        self.starmap_system_var.set(self.starmap.current_system)
+        self.starmap_x_var.set(str(self.starmap.settings["search_x"]))
+        self.starmap_y_var.set(str(self.starmap.settings["search_y"]))
+
+    def _starmap_apply_toggles(self, *_):
+        if self.starmap is None:
+            return
+        self.starmap.settings["current_system"] = (
+            self.starmap_system_var.get().strip().title() or "Stanton"
+        )
+        self.starmap.settings["auto_detect_system"] = bool(
+            self.starmap_autodetect_var.get()
+        )
+        self.starmap.settings["block_cross_system"] = bool(
+            self.starmap_block_var.get()
+        )
+        self.starmap.settings["verify_route"] = bool(
+            self.starmap_verify_var.get()
+        )
+        for key, var in self.starmap_delay_vars.items():
+            try:
+                self.starmap.settings[key] = max(0.0, float(var.get()))
+            except (TypeError, ValueError):
+                pass
+
+        self._save_starmap_settings()
+        self._save_settings()
+
+    def _starmap_capture_position(self):
+        """Record where the mouse is after a countdown."""
+        self.starmap_capture_label.configure(
+            text="Hover the mouse over the search bar in game..."
+        )
+        self._starmap_countdown(5)
+
+    def _starmap_countdown(self, remaining):
+        if remaining > 0:
+            self.starmap_capture_label.configure(
+                text=f"Capturing the cursor position in {remaining}..."
+            )
+            self.after(1000, self._starmap_countdown, remaining - 1)
+            return
+
+        try:
+            x, y = get_cursor_pos(physical=True)
+        except Exception as exc:
+            self.starmap_capture_label.configure(text=f"Capture failed: {exc}")
+            return
+
+        self.starmap_x_var.set(str(x))
+        self.starmap_y_var.set(str(y))
+        self.starmap_capture_label.configure(
+            text=f"Captured ({x}, {y}). Press SAVE to keep it."
+        )
+
+    def _starmap_save_position(self):
+        try:
+            x = int(float(self.starmap_x_var.get()))
+            y = int(float(self.starmap_y_var.get()))
+        except (TypeError, ValueError):
+            messagebox.showerror("Star Map", "X and Y must be numbers.")
+            return
+
+        self.starmap.settings["search_x"] = x
+        self.starmap.settings["search_y"] = y
+        self._starmap_apply_toggles()
+        self.starmap_capture_label.configure(
+            text=f"Saved search bar position ({x}, {y})."
+        )
+
+    def _starmap_test_route(self):
+        destination = self.starmap_test_var.get().strip()
+        if not destination:
+            messagebox.showerror("Star Map", "Enter a destination to test.")
+            return
+
+        if not messagebox.askyesno(
+            "Test Route",
+            f"Plot a course to {destination}?\n\n"
+            "Star Citizen must be running and in focus, seated in your ship, "
+            "with the mobiGlas CLOSED.\n\n"
+            "You have five seconds to switch to the game."
+        ):
+            return
+
+        self._starmap_apply_toggles()
+        self._history_add(f"Star map test: {destination} in 5 seconds.", "info")
+        self.after(5000, lambda: self._run_starmap(
+            self._starmap_route, destination
+        ))
+
     def _build_guides_page(self):
         self.guides_page = self._build_link_page(
             "GUIDES",
@@ -4232,8 +5061,16 @@ class VoiceKeybindApp(tk.Tk):
 
     def stop_listening(self, reason="Voice control stopped."):
         self.running = False
+        # Stopping voice control also stops repeats. Leaving one running with
+        # the microphone off would mean no way to cancel it by voice.
+        stopped = self.repeats.stop_all(announce=False)
         self._set_status()
         self._history_add(reason)
+        if stopped:
+            self._history_add(
+                f"Also stopped {stopped} repeating action(s).", "info"
+            )
+        self._refresh_repeat_list()
 
     def _speak(self, phrase="Command confirmed.", force=False):
         if not force and not self.voice_feedback_var.get():
@@ -4488,6 +5325,265 @@ class VoiceKeybindApp(tk.Tk):
             answer = f"I could not find current Star Citizen Wiki locations for the ship weapon {weapon}."
             self.events.put(("ship_weapon_voice_error", answer))
             self._speak(answer, force=True)
+    # -------------------- star map navigation --------------------
+    def _create_starmap_controller(self):
+        """Build the star map controller from saved settings."""
+        saved = self.settings.get("starmap", {})
+        if not isinstance(saved, dict):
+            saved = {}
+
+        def log(text, kind="info"):
+            # Always via the queue: this is called from a worker thread.
+            self.events.put((kind if kind in ("error",) else "info", text))
+
+        self.starmap = starmap_module.StarMapController(
+            settings=saved,
+            speak=lambda text: self._speak(text, force=True),
+            log=log,
+        )
+
+    def _save_starmap_settings(self):
+        """Persist only the values the STAR MAP page can change."""
+        if self.starmap is None:
+            return
+        keys = (
+            "search_x", "search_y", "current_system", "auto_detect_system",
+            "block_cross_system", "verify_route", "delay_click", "delay_type",
+            "delay_select", "delay_route", "map_open_attempts",
+            "hud_poll_attempts",
+        )
+        self.settings["starmap"] = {
+            key: self.starmap.settings[key]
+            for key in keys
+            if key in self.starmap.settings
+        }
+
+    def _starmap_running(self):
+        return self.starmap_busy.locked()
+
+    def _run_starmap(self, function, *args):
+        """Run a star map operation on a worker thread.
+
+        route_to() takes 10-15 seconds. Running it inline would deafen the
+        listener for that whole time, so "stop repeating" and every other
+        command would go unheard until it finished.
+        """
+        if self.starmap is None:
+            return False
+
+        if not self.starmap_busy.acquire(blocking=False):
+            self._speak("I am still working on the last navigation request.",
+                        force=True)
+            self.events.put(("info", "Star map request ignored — already busy."))
+            return False
+
+        def worker():
+            try:
+                function(*args)
+            except Exception as exc:
+                self.events.put(("error", f"Star map error: {exc}"))
+                self._speak("The navigation command failed.", force=True)
+            finally:
+                self.starmap_busy.release()
+                self.events.put(("starmap_done", ""))
+
+        threading.Thread(
+            target=worker, name="KabutopzStarMap", daemon=True
+        ).start()
+        return True
+
+    def _starmap_route(self, destination):
+        ok, message = self.starmap.route_to(destination)
+        self.events.put(("match" if ok else "error", f"Star map: {message}"))
+
+    def _handle_starmap_speech(self, heard):
+        """Intercept navigation phrases before the general keybind matcher.
+
+        Returns True when the phrase was handled here.
+        """
+        if self.starmap is None:
+            return False
+
+        normalized = heard.strip(" ,.!?-")
+
+        if any(phrase in normalized for phrase in STARMAP_CLOSE_PHRASES):
+            self._run_starmap(self.starmap.close_map)
+            return True
+
+        # Checked before the route pattern so "open star map" is never read
+        # as a destination.
+        if any(phrase in normalized for phrase in STARMAP_OPEN_PHRASES):
+            self._run_starmap(self.starmap.open_map)
+            return True
+
+        if any(phrase in normalized for phrase in STARMAP_WHICH_SYSTEM_PHRASES):
+            self._speak(
+                f"You are in the {self.starmap.current_system} system.",
+                force=True,
+            )
+            return True
+
+        match = STARMAP_SET_SYSTEM_PATTERN.search(normalized)
+        if match:
+            system = match.group("system").strip(" .,")
+            if system:
+                self.starmap.set_system(system)
+                self._save_starmap_settings()
+                self._save_settings()
+                self._refresh_starmap_page()
+                self._speak(
+                    f"Current system set to {self.starmap.current_system}.",
+                    force=True,
+                )
+                return True
+
+        match = STARMAP_ROUTE_PATTERN.search(normalized)
+        if match:
+            destination = match.group("dest").strip(" .,")
+            if destination:
+                self.events.put(("info", f"Navigation request: {destination}"))
+                self._run_starmap(self._starmap_route, destination)
+                return True
+
+        return False
+
+    # -------------------- repeating actions --------------------
+    def _refresh_repeat_list(self):
+        if not hasattr(self, "repeat_list"):
+            return
+
+        jobs = self.repeats.active_jobs()
+        self.repeat_active_ids = [action_id for action_id, _, _ in jobs]
+
+        self.repeat_list.delete(0, tk.END)
+        if not jobs:
+            self.repeat_list.insert(tk.END, "  (nothing repeating)")
+            return
+
+        for _, label, interval in jobs:
+            self.repeat_list.insert(tk.END, f"  {label} — every {interval:g}s")
+
+    def _stop_selected_repeat(self):
+        selected = self.repeat_list.curselection()
+        ids = getattr(self, "repeat_active_ids", [])
+        if not selected or not ids:
+            return
+
+        index = selected[0]
+        if index >= len(ids):
+            return
+
+        label = self.repeats.stop(ids[index])
+        if label:
+            self._history_add(f"Repeat stopped: {label}", "info")
+        self._refresh_repeat_list()
+
+    def _stop_all_repeats(self):
+        stopped = self.repeats.stop_all(announce=False)
+        if stopped:
+            self._history_add(
+                f"Stopped {stopped} repeating action(s).", "info"
+            )
+        self._refresh_repeat_list()
+
+    def _repeat_settings_for(self, action_id):
+        """Return the repeat config for an action, defaults included."""
+        action = ACTIONS.get(action_id, {})
+        return (
+            bool(action.get("repeat", False)),
+            clamp_repeat_interval(
+                action.get("repeat_interval", REPEAT_DEFAULT_INTERVAL)
+            ),
+            action.get("repeat_cancel_phrases", []) or [],
+            str(action.get("repeat_cancel_response", "") or ""),
+            str(action.get("repeat_start_response", "") or ""),
+        )
+
+    def _default_repeat_interval(self):
+        if hasattr(self, "repeat_default_var"):
+            return clamp_repeat_interval(self.repeat_default_var.get())
+        saved = self.settings.get("repeat_defaults", {})
+        return clamp_repeat_interval(saved.get("interval"))
+
+    def _begin_repeat(self, action_id, interval=None, speak_start=True):
+        """Start repeating an action and announce it. Returns True on success."""
+        action = ACTIONS.get(action_id)
+        if action is None:
+            return False
+
+        label = action["label"]
+        if action_id in NEVER_REPEAT:
+            self._speak(f"{label} cannot be repeated.", force=True)
+            self.events.put((
+                "error", f"Refused to repeat a protected action: {label}"
+            ))
+            return False
+
+        _, configured, _, _, start_response = self._repeat_settings_for(action_id)
+        if interval is None:
+            interval = configured
+
+        bound_key = self.keybinds.get(action_id, action["key"])
+
+        try:
+            interval = self.repeats.start(
+                action_id,
+                label,
+                action["type"],
+                bound_key,
+                action["hold"],
+                interval,
+            )
+        except Exception as exc:
+            self.events.put(("error", f"Could not start repeat: {exc}"))
+            return False
+
+        self.events.put((
+            "repeat_start",
+            f"Repeating {label} → {bound_key} every {interval:g}s",
+        ))
+
+        if speak_start:
+            self._speak(
+                start_response
+                or f"Repeating {label} every {interval:g} seconds.",
+                force=True,
+            )
+        return True
+
+    def _repeat_cancel_match(self, heard):
+        """Return the action_id whose stop phrase matches, if any.
+
+        Only currently-running repeats are considered, so a phrase like
+        "I'm back" is inert until the matching repeat is actually going.
+        """
+        normalized = heard.strip(" ,.!?-")
+        for action_id, _, _ in self.repeats.active_jobs():
+            _, _, cancel_phrases, _, _ = self._repeat_settings_for(action_id)
+            for phrase in cancel_phrases:
+                if phrase and phrase in normalized:
+                    return action_id
+        return None
+
+    def _extract_repeat_last_request(self, heard):
+        """Parse "repeat that" / "repeat that every N seconds"."""
+        match = REPEAT_LAST_PATTERN.search(heard)
+        if not match:
+            return None
+
+        amount = match.group("amount")
+        if amount is None:
+            return self._default_repeat_interval()
+
+        try:
+            seconds = float(amount)
+        except ValueError:
+            return self._default_repeat_interval()
+
+        unit = (match.group("unit") or "s").lower()
+        if unit.startswith("m"):
+            seconds *= 60.0
+        return clamp_repeat_interval(seconds)
 
     def _build_phrase_matcher(self):
         pairs = []
@@ -4635,12 +5731,77 @@ class VoiceKeybindApp(tk.Tk):
                         self.events.put(("voice_off", ""))
                         break
 
+                    # A running repeat's own stop phrase wins over everything
+                    # else, so "I'm back" can never be swallowed by a keybind
+                    # phrase that happens to be a substring of it.
+                    cancel_id = self._repeat_cancel_match(normalized)
+                    if cancel_id is not None:
+                        _, _, _, cancel_reply, _ = self._repeat_settings_for(
+                            cancel_id
+                        )
+                        label = self.repeats.stop(cancel_id, announce=False)
+                        self._speak(
+                            cancel_reply or f"{label} stopped.",
+                            force=True,
+                        )
+                        self.events.put((
+                            "repeat_stop", f"Repeat stopped by voice: {label}"
+                        ))
+                        continue
+
+                    # Global "stop repeating".
+                    if any(
+                        phrase in normalized
+                        for phrase in REPEAT_STOP_ALL_PHRASES
+                    ):
+                        stopped = self.repeats.stop_all(announce=False)
+                        if stopped:
+                            self._speak(
+                                f"Stopped {stopped} repeating "
+                                f"{'action' if stopped == 1 else 'actions'}.",
+                                force=True,
+                            )
+                            self.events.put((
+                                "repeat_stop",
+                                f"Stopped {stopped} repeating action(s) by voice.",
+                            ))
+                        else:
+                            self._speak("Nothing is repeating.", force=True)
+                            self.events.put((
+                                "info", "Stop repeat requested, nothing running."
+                            ))
+                        continue
+
+                    # "repeat that" / "repeat that every 30 seconds".
+                    repeat_interval = self._extract_repeat_last_request(heard)
+                    if repeat_interval is not None:
+                        if self.last_action is None:
+                            self._speak(
+                                "I do not have a command to repeat yet.",
+                                force=True,
+                            )
+                            self.events.put((
+                                "info", "Repeat requested with no previous action."
+                            ))
+                        else:
+                            self._begin_repeat(
+                                self.last_action, interval=repeat_interval
+                            )
+                        continue
+
                     # Acknowledge a polite sign-off without sending a keybind.
                     thanks_normalized = normalized.replace(",", "")
                     if thanks_normalized in THANK_YOU_COMPUTER_PHRASES:
                         response = random.choice(THANK_YOU_COMPUTER_RESPONSES)
                         self._speak(response, force=True)
                         self.events.put(("info", f"Computer: {response}"))
+                        continue
+
+                    # Star map navigation. Must come before the phrase
+                    # matcher: "open star map" would otherwise match the
+                    # plain open_map keybind and just tap F2 without ever
+                    # focusing the search bar.
+                    if self._handle_starmap_speech(heard):
                         continue
 
                     # Reverse mining lookup takes priority over gameplay keybinds.
@@ -4710,6 +5871,22 @@ class VoiceKeybindApp(tk.Tk):
                             self.last_triggered[action_id] = now
                             action = ACTIONS[action_id]
                             bound_key = self.keybinds.get(action_id, action["key"])
+                            self.last_action = action_id
+
+                            repeat_enabled, _, _, _, _ = (
+                                self._repeat_settings_for(action_id)
+                            )
+
+                            # A repeat-enabled command loops instead of firing
+                            # once. The first tick happens inside the repeat
+                            # thread, so nothing is sent twice.
+                            if repeat_enabled:
+                                self.events.put((
+                                    "match",
+                                    f"{action['label']} ← “{phrase}” → {bound_key} [repeat]",
+                                ))
+                                self._begin_repeat(action_id)
+                                break
 
                             try:
                                 self._run_action(
@@ -4779,6 +5956,21 @@ class VoiceKeybindApp(tk.Tk):
                     self._history_add(
                         value, "info"
                     )
+                elif kind == "starmap_ocr":
+                    available, description = value
+                    if hasattr(self, "starmap_status_label"):
+                        self.starmap_status_label.configure(text=description)
+                    if not available:
+                        self._history_add(description, "error")
+                elif kind == "starmap_done":
+                    self._refresh_starmap_page()
+                elif kind in ("repeat_start", "repeat_stop"):
+                    self._history_add(value, "match")
+                    self._refresh_repeat_list()
+                elif kind == "repeat_tick":
+                    self._history_add(value, "info")
+                elif kind == "repeat_changed":
+                    self._refresh_repeat_list()
                 elif kind == "mining_reverse":
                     self._history_add(
                         f"Mining lookup: {value}"
@@ -4834,6 +6026,8 @@ class VoiceKeybindApp(tk.Tk):
                     self._history_add(value, "error")
                 elif kind == "voice_off":
                     self.running = False
+                    self.repeats.stop_all(announce=False)
+                    self._refresh_repeat_list()
                     self._set_status()
                     self._history_add(
                         'Voice command "computer turn off" stopped listening.'
@@ -4916,6 +6110,7 @@ class VoiceKeybindApp(tk.Tk):
                 bound_key,
                 action["hold"],
             )
+            self.last_action = action_id
             self._history_add(
                 f"Manual test: {action['label']} → {bound_key}",
                 "match",
@@ -4929,6 +6124,7 @@ class VoiceKeybindApp(tk.Tk):
 
     def on_close(self):
         self.running = False
+        self.repeats.stop_all(announce=False)
         if self.voice_toggle_hotkey is not None:
             self.voice_toggle_hotkey.stop()
             self.voice_toggle_hotkey = None
