@@ -74,15 +74,39 @@ except Exception:
     print("FAIL  constructor raised:")
     traceback.print_exc(); sys.exit(1)
 
-# Every page in PAGE_ORDER must actually show without raising.
+# Every page in PAGE_ORDER must show — and must show the RIGHT frame.
+#
+# Checking only that show_page() does not raise is what let a missing
+# entry through: show_page fell back to the voice page, so selecting
+# VOICE CLONES silently displayed VOICE PROTOCOL. No error, no clue.
 for page in mod.PAGE_ORDER:
     try:
         app.show_page(page)
         app.update_idletasks()
-        print(f"PASS  show_page({page!r})")
+
+        expected = app.page_frames[page]
+        showing = [
+            name for name, frame in app.page_frames.items()
+            if frame.winfo_ismapped()
+        ]
+        good = showing == [page] and expected.winfo_ismapped()
+        print(f"{'PASS' if good else 'FAIL'}  show_page({page!r}) "
+              f"-> {showing}")
+        if not good:
+            failures.append(f"show_page({page!r}) showed {showing}")
     except Exception as exc:
         failures.append(f"show_page({page!r}): {exc}")
         print(f"FAIL  show_page({page!r}): {exc}")
+
+# Every tab must be able to reach a frame, and vice versa. _register_pages
+# raises at startup if not, so getting here at all is most of the proof.
+try:
+    good = set(app.page_frames) == set(mod.PAGE_ORDER)
+    print(f"{'PASS' if good else 'FAIL'}  every page in PAGE_ORDER has a frame")
+    if not good:
+        failures.append("page frames and PAGE_ORDER disagree")
+except Exception as exc:
+    failures.append(f"page registry: {exc}")
 
 # The new widgets must exist and respond.
 for name in ("starmap_page","starmap_x_var","starmap_system_var","starmap_test_var",
@@ -402,6 +426,27 @@ try:
     good = spoken and spoken[-1] == "Voice calibrated."
     print(f"{'PASS' if good else 'FAIL'}  switching says {spoken[-1]!r}")
     if not good: failures.append("switch reply")
+
+    app._handle_voice_switch("switch to windows voice")
+    # A name is not a dictionary word: the recogniser gave back "captain
+    # fascinate" for "Captain FasciN8", which matches nothing exactly.
+    _vc.create_voice(app_dir, "Captain FasciN8", ref)
+    for heard, expect in [("switch to captain fascinate voice", "captain-fascin8"),
+                          ("switch to captain fascin8 voice", "captain-fascin8"),
+                          ("switch to captain fassinate voice", "captain-fascin8")]:
+        app.active_voice = None
+        app._handle_voice_switch(heard)
+        got = app.active_voice.slug if app.active_voice else None
+        good = got == expect
+        print(f"{'PASS' if good else 'FAIL'}  mis-heard name: \"{heard}\" -> {got}")
+        if not good: failures.append(f"fuzzy name {heard}")
+
+    # But a genuinely different name must still be refused.
+    app.active_voice = None
+    app._handle_voice_switch("switch to margaret thatcher voice")
+    good = app.active_voice is None
+    print(f"{'PASS' if good else 'FAIL'}  an unrelated name is still refused")
+    if not good: failures.append("fuzzy matched an unrelated name")
 
     app._handle_voice_switch("switch to windows voice")
     good = app.active_voice is None

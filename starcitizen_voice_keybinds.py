@@ -803,6 +803,7 @@ class VoiceKeybindApp(tk.Tk):
         self._build_guides_page()
         self._build_announcements_page()
         self._build_credit_page()
+        self._register_pages()
 
         self._configure_voice_toggle_hotkey(
             self.settings.get("voice_toggle_hotkey", ""),
@@ -1497,46 +1498,55 @@ class VoiceKeybindApp(tk.Tk):
     def _open_buy_me_a_coffee(self, *_):
         webbrowser.open_new_tab(BUY_ME_A_COFFEE_URL)
 
-    def show_page(self, name):
-        if name not in PAGE_ORDER:
-            name = "VOICE PROTOCOL"
-        self.page_var.set(name)
-        for page in (
-            self.voice_page,
-            self.how_to_page,
-            self.components_page,
-            self.ship_weapons_page,
-            self.commodities_page,
-            self.customize_page,
-            self.phrases_page,
-            self.custom_words_page,
-            self.keybinds_page,
-            self.starmap_page,
-            self.mining_page,
-            self.ship_finder_page,
-            self.guides_page,
-            self.announcements_page,
-            self.credit_page,
-        ):
-            page.pack_forget()
+    def _register_pages(self):
+        """One mapping from page name to frame, built once.
 
-        pages = {
+        Previously show_page kept its own hand-written dict and a
+        `pages.get(name, self.voice_page)` fallback, so a page added to
+        PAGE_ORDER but missed here silently displayed the voice page
+        instead — no error, no clue, just the wrong screen. Building the
+        mapping in one place and checking it against PAGE_ORDER turns that
+        into a loud failure at startup.
+        """
+        self.page_frames = {
+            "VOICE PROTOCOL": self.voice_page,
             "HOW TO": self.how_to_page,
+            "CUSTOMIZE": self.customize_page,
+            "PHRASES": self.phrases_page,
+            "KEYBINDS": self.keybinds_page,
+            "CUSTOM WORDS": self.custom_words_page,
+            "STAR MAP": self.starmap_page,
+            "VOICE CLONES": self.voice_clones_page,
             "COMPONENTS": self.components_page,
             "SHIP WEAPONS": self.ship_weapons_page,
             "COMMODITIES": self.commodities_page,
-            "CUSTOMIZE": self.customize_page,
-            "PHRASES": self.phrases_page,
-            "CUSTOM WORDS": self.custom_words_page,
-            "KEYBINDS": self.keybinds_page,
-            "STAR MAP": self.starmap_page,
             "MINING MODE": self.mining_page,
             "SHIP FINDER": self.ship_finder_page,
             "GUIDES": self.guides_page,
             "ANNOUNCEMENTS": self.announcements_page,
             "CREDIT": self.credit_page,
         }
-        pages.get(name, self.voice_page).pack(fill="both", expand=True)
+
+        missing = [name for name in PAGE_ORDER if name not in self.page_frames]
+        if missing:
+            raise RuntimeError(
+                f"These pages are in PAGE_ORDER but have no frame: {missing}"
+            )
+        extra = [name for name in self.page_frames if name not in PAGE_ORDER]
+        if extra:
+            raise RuntimeError(
+                f"These frames are not in PAGE_ORDER: {extra}"
+            )
+
+    def show_page(self, name):
+        if name not in PAGE_ORDER:
+            name = "VOICE PROTOCOL"
+        self.page_var.set(name)
+
+        for page in self.page_frames.values():
+            page.pack_forget()
+
+        self.page_frames[name].pack(fill="both", expand=True)
         self._update_page_tabs(name)
 
     def _update_page_tabs(self, selected):

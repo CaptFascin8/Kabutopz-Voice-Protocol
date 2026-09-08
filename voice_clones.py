@@ -30,6 +30,7 @@ Plain folders and plain JSON, so a voice can be backed up, copied to
 another machine, or deleted in Explorer without the app's help.
 """
 
+import difflib
 import hashlib
 import json
 import re
@@ -64,6 +65,11 @@ RECORD_SAMPLE_RATE = 24000
 RECORD_CHANNELS = 1
 RECORD_SECONDS = 12.0
 MIN_REFERENCE_SECONDS = 4.0
+
+# How close a spoken name has to be. High enough that two different voices
+# are not confused, low enough to survive the recogniser inventing a
+# spelling: "captain fascinate" scores about 0.87 against "captainfascin8".
+NAME_MATCH_THRESHOLD = 0.72
 
 # Chatterbox clones from roughly seven seconds. The script exists because a
 # clean, varied ten seconds beats a noisy thirty: background music, room
@@ -262,13 +268,26 @@ def find_voice(app_dir, name_or_slug):
     for voice in voices:
         if slugify(voice.name) == target:
             return voice
-    # Last resort: ignore separators entirely, so "shipcomputer" finds
-    # "Ship Computer".
+    # Ignore separators, so "shipcomputer" finds "Ship Computer".
     flat = target.replace("-", "")
     for voice in voices:
         if slugify(voice.name).replace("-", "") == flat:
             return voice
-    return None
+
+    # Last resort: closest match. A name is not a dictionary word, and the
+    # recogniser will not spell it back the way it was typed — "Captain
+    # FasciN8" came back as "captain fascinate", which matches nothing
+    # exactly and everything approximately. Refusing that is technically
+    # correct and practically useless.
+    best, best_score = None, 0.0
+    for voice in voices:
+        score = difflib.SequenceMatcher(
+            None, flat, slugify(voice.name).replace("-", "")
+        ).ratio()
+        if score > best_score:
+            best, best_score = voice, score
+
+    return best if best_score >= NAME_MATCH_THRESHOLD else None
 
 
 def create_voice(app_dir, name, reference_wav, engine=DEFAULT_ENGINE,
