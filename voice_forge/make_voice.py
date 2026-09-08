@@ -103,6 +103,8 @@ def render(voice, lines, python=None, dry_run=False, device="auto"):
             print(f"   rendering {event['total']} lines on {event['device']}")
         elif kind == "line":
             print(f"   [{event['index']}/{event['total']}] {event['text']}")
+        elif kind == "warning":
+            print(f"   NOTE: {event['message']}")
         elif kind == "line_failed":
             failures.append(event["text"])
             print(f"   FAILED: {event['text']} — {event.get('message')}")

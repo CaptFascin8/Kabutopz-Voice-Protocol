@@ -118,6 +118,23 @@ class Renderer:
             pass
         return "cpu"
 
+    def gpu_pressure(self):
+        """Free VRAM in GB, or None when not on a GPU.
+
+        Rendering while a game has the card is dramatically slower — a
+        measured 254s versus 102s for the same five lines, with Star
+        Citizen holding 8.5 of 12 GB. Without this the pilot just sees a
+        mysteriously slow render and reasonably blames the tool.
+        """
+        if self.device != "cuda":
+            return None
+        try:
+            import torch
+            free, total = torch.cuda.mem_get_info()
+            return free / 1024 ** 3, total / 1024 ** 3
+        except Exception:
+            return None
+
     def load(self):
         from chatterbox.tts import ChatterboxTTS
         self.model = ChatterboxTTS.from_pretrained(device=self.device)
@@ -218,6 +235,17 @@ def main():
             return 3
 
     device = renderer.device if renderer else "dry-run"
+
+    # Say it before the long part starts, not after.
+    if renderer is not None:
+        pressure = renderer.gpu_pressure()
+        if pressure and pressure[0] < 3.0:
+            emit(event="warning",
+                 message=f"Only {pressure[0]:.1f} GB of {pressure[1]:.0f} GB "
+                         f"of video memory is free — something else is using "
+                         f"the GPU. Close it and rendering will be several "
+                         f"times faster, or re-run with --device cpu.")
+
     emit(event="start", total=len(pending), device=device)
 
     started = time.time()
