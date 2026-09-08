@@ -27,12 +27,19 @@ tested end to end before anyone installs two gigabytes of PyTorch.
 
 import argparse
 import json
-import math
+import os
 import struct
 import sys
 import time
 import wave
 from pathlib import Path
+
+# Chatterbox draws a tqdm bar per sampling step — a thousand lines of
+# "Sampling: 3%|..." per rendered clip, which drowns our own JSON progress
+# and makes a log file useless. Set before torch or chatterbox is imported.
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
 # 16-bit PCM, always. Chatterbox hands back float32 audio, and a float WAV
@@ -93,11 +100,19 @@ class Renderer:
 
     @staticmethod
     def _pick_device(requested):
+        """CUDA when it is really usable, CPU otherwise.
+
+        ``torch.cuda.is_available()`` can be True on a machine whose driver
+        and wheel disagree, and the failure then arrives deep inside the
+        first generate() call. Asking for the device name up front turns
+        that into a clean fall back to CPU.
+        """
         if requested and requested != "auto":
             return requested
         try:
             import torch
             if torch.cuda.is_available():
+                torch.cuda.get_device_name(0)
                 return "cuda"
         except Exception:
             pass

@@ -2,3 +2,13 @@ build/
 dist/
 __pycache__/
 *.spec
+
+# The Voice Forge sidecar installs its own Python environment in place.
+# It is roughly 2 GB of PyTorch and belongs on the machine that runs it,
+# never in the repository — setup_voice_forge.bat recreates it in minutes.
+voice_forge/.venv/
+voice_forge/*_log.txt
+
+# Rendered voices live in the user's settings folder, not here, but a
+# stray reference recording is easy to drop in by accident.
+*.wav
