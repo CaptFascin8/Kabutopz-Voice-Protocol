@@ -170,6 +170,52 @@ class Voice:
             out.append(text)
         return out
 
+    # ---- lines the app wanted but did not have --------------------------
+    #
+    # A catalogue can only anticipate so much. When the app speaks something
+    # with no clip, it says so here, and the VOICE CLONES page can then
+    # offer to render exactly the lines that actually came up rather than
+    # asking the pilot to guess. The gap closes itself over a few sessions.
+    MISS_FILE = "missing.json"
+
+    def _read_misses(self):
+        try:
+            data = json.loads((self.path / self.MISS_FILE).read_text("utf-8"))
+            return [str(item) for item in data] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def note_miss(self, text):
+        """Record a line spoken without a clip. Never raises."""
+        text = " ".join(str(text).split())
+        if not text or self.has(text):
+            return
+        try:
+            misses = self._read_misses()
+            if any(line_key(m) == line_key(text) for m in misses):
+                return
+            misses.append(text)
+            # Bounded: this is a to-do list, not a transcript.
+            (self.path / self.MISS_FILE).write_text(
+                json.dumps(misses[-500:], indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def logged_misses(self):
+        """Lines the app has needed and not had, still unrendered."""
+        return [text for text in self._read_misses() if not self.has(text)]
+
+    def clear_misses(self):
+        try:
+            (self.path / self.MISS_FILE).unlink()
+        except Exception:
+            pass
+
+    def pending(self, catalog):
+        """Everything worth rendering next: catalogue gaps, then real misses."""
+        return dedupe(self.missing(catalog) + self.logged_misses())
+
     def as_row(self):
         """One line for the voices list in the UI."""
         return (
@@ -336,18 +382,62 @@ def line_catalog(destinations=(), systems=(), extra=()):
             )
 
     lines.extend(str(item) for item in extra if str(item).strip())
+    return dedupe(lines)
 
-    # Preserve order, drop duplicates — the same sentence can arrive from
-    # two places and rendering it twice is wasted minutes.
+
+def dedupe(lines):
+    """Preserve order, drop repeats.
+
+    The same sentence arrives from two places often enough — a custom reply
+    that happens to match a built-in one — and rendering it twice is wasted
+    minutes.
+    """
     seen = set()
     unique = []
     for text in lines:
+        # None must be dropped, not stringified: a settings field that has
+        # never been filled in reads back as None, and str(None) is the
+        # word "None" — which would render as a clip of the ship computer
+        # solemnly saying "None".
+        if text is None:
+            continue
+        text = str(text).strip()
+        if not text:
+            continue
         key = line_key(text)
         if key in seen:
             continue
         seen.add(key)
         unique.append(text)
     return unique
+
+
+def custom_replies(settings):
+    """Every spoken reply the pilot has typed into the app.
+
+    Custom commands and the wake word phrases all carry editable replies.
+    They are the lines most worth having in the cloned voice — they are the
+    ones the pilot chose — and they are exactly the ones a fixed catalogue
+    would miss. Read from settings rather than hard-coded so that adding a
+    reply in the UI is enough to make it renderable.
+    """
+    if not isinstance(settings, dict):
+        return []
+
+    found = []
+
+    for action in settings.get("custom_actions", []) or []:
+        if not isinstance(action, dict):
+            continue
+        for field in ("repeat_cancel_response", "repeat_start_response"):
+            found.append(action.get(field, ""))
+
+    wake = settings.get("wake_word", {})
+    if isinstance(wake, dict):
+        found.append(wake.get("enter_response", ""))
+        found.append(wake.get("wake_response", ""))
+
+    return dedupe(found)
 
 
 # ---- audio ------------------------------------------------------------

@@ -211,6 +211,70 @@ def test_audio_helpers(app_dir):
     print("   [PASS] play/stop are safe with no audio device")
 
 
+def test_custom_replies_and_misses(app_dir):
+    print("\n9. Custom replies and lines the app actually needed")
+
+    settings = {
+        "custom_actions": [
+            {"repeat_cancel_response": "Welcome back, pilot.",
+             "repeat_start_response": "Going idle."},
+            {"repeat_cancel_response": "", "repeat_start_response": None},
+            {"repeat_cancel_response": "Welcome back, pilot."},
+        ],
+        "wake_word": {"enter_response": "Going quiet.",
+                      "wake_response": "At your service."},
+    }
+    replies = vc.custom_replies(settings)
+    check("picks up every typed reply, de-duplicated",
+          replies,
+          ["Welcome back, pilot.", "Going idle.",
+           "Going quiet.", "At your service."])
+    check("blank and None replies are dropped",
+          any(not r for r in replies), False)
+    check("junk settings do not raise", vc.custom_replies("nonsense"), [])
+    check("missing keys do not raise", vc.custom_replies({}), [])
+
+    # Those replies belong in the catalogue.
+    catalog = vc.line_catalog(extra=replies)
+    check("custom replies reach the catalogue",
+          "Welcome back, pilot." in catalog, True)
+
+    voice = vc.find_voice(app_dir, "Ship Computer")
+    voice.clear_misses()
+
+    # The app speaks something nobody anticipated.
+    voice.note_miss("Course set to Checkmate.")
+    voice.note_miss("Course set to Checkmate.")
+    voice.note_miss("  Course  set to   Checkmate.  ")
+    check("a miss is logged once, whitespace-insensitive",
+          voice.logged_misses(), ["Course set to Checkmate."])
+
+    check("blank misses are ignored",
+          (voice.note_miss("   "), voice.logged_misses())[1],
+          ["Course set to Checkmate."])
+
+    # Render it, and it stops being outstanding.
+    make_wav(voice.clips_dir / f"{vc.line_key('Course set to Checkmate.')}.wav", 1.0)
+    check("a rendered miss drops off the list", voice.logged_misses(), [])
+
+    # A line already rendered is never logged in the first place.
+    voice.note_miss("Course set to Checkmate.")
+    check("rendered lines are not re-logged", voice.logged_misses(), [])
+
+    # pending() is what the render button acts on.
+    pending = voice.pending(["Standing by.", "Course set to Checkmate."])
+    check("pending is catalogue gaps plus real misses",
+          pending, ["Standing by."])
+
+    voice.note_miss("Docking clamps released.")
+    check("pending includes logged misses",
+          voice.pending(["Standing by."]),
+          ["Standing by.", "Docking clamps released."])
+
+    check("misses survive a reload",
+          vc.Voice(voice.path).logged_misses(), ["Docking clamps released."])
+
+
 def main():
     print("Kabutopz Voice Protocol — cloned voice storage tests")
     app_dir = Path(tempfile.mkdtemp(prefix="kvp-voices-"))
@@ -223,6 +287,7 @@ def main():
         test_stale_format(app_dir)
         test_delete(app_dir)
         test_audio_helpers(app_dir)
+        test_custom_replies_and_misses(app_dir)
     finally:
         shutil.rmtree(app_dir, ignore_errors=True)
 
