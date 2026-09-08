@@ -123,6 +123,8 @@ try:
                          ("CUSTOM WORDS", "CLEAR FORM"),
                          ("CUSTOM WORDS", "DELETE CUSTOM COMMAND"),
                          ("STAR MAP", "TEST ROUTE"),
+                         ("CUSTOMIZE", "ENABLE WAKE WORD MODE"),
+                         ("CUSTOMIZE", "RESET TO INDUSTRIAL ORANGE"),
                          ("STAR MAP", "CAPTURE POSITION (5S)")):
         app.show_page(page); app.update_idletasks(); app.update()
         w = _find(app, button)
@@ -154,30 +156,32 @@ except Exception as exc:
     failures.append(f"layout: {exc}"); print(f"FAIL  layout: {exc}"); traceback.print_exc()
 
 # ---- the decisive check: does scrolling REVEAL the hidden button? -----
-try:
-    app.show_page("CUSTOM WORDS"); app.update_idletasks(); app.update()
-    btn = _find(app, "CREATE CUSTOM COMMAND")
-    canvas = [c for c in _canvases(app.custom_words_page, []) if c.cget("scrollregion")][0]
+for _page, _attr, _button in (("CUSTOM WORDS", "custom_words_page", "CREATE CUSTOM COMMAND"),
+                              ("CUSTOMIZE", "customize_page", "RESET TO INDUSTRIAL ORANGE")):
+    try:
+        app.show_page(_page); app.update_idletasks(); app.update()
+        btn = _find(app, _button)
+        canvas = [c for c in _canvases(getattr(app, _attr), []) if c.cget("scrollregion")][0]
 
-    win_h = app.winfo_height()
-    before = btn.winfo_rooty() - app.winfo_rooty()
-    canvas.yview_moveto(1.0)
-    app.update_idletasks(); app.update()
-    after = btn.winfo_rooty() - app.winfo_rooty()
+        win_h = app.winfo_height()
+        before = btn.winfo_rooty() - app.winfo_rooty()
+        canvas.yview_moveto(1.0)
+        app.update_idletasks(); app.update()
+        after = btn.winfo_rooty() - app.winfo_rooty()
 
-    moved = after < before
-    visible = 0 <= after <= win_h
-    print(f"      window height {win_h}px")
-    print(f"      button y before scroll: {before}  (visible: {0 <= before <= win_h})")
-    print(f"      button y after  scroll: {after}  (visible: {visible})")
-    print(f"{'PASS' if moved else 'FAIL'}  scrolling moves the button up")
-    if not moved: failures.append("scroll does not move content")
-    print(f"{'PASS' if visible else 'FAIL'}  CREATE CUSTOM COMMAND reachable after scrolling")
-    if not visible: failures.append("button still unreachable")
+        moved = after < before
+        visible = 0 <= after <= win_h
+        print(f"      {_page}: window {win_h}px, {_button} y {before} -> {after}"
+              f" (visible: {0 <= before <= win_h} -> {visible})")
+        print(f"{'PASS' if moved else 'FAIL'}  {_page}: scrolling moves content up")
+        if not moved: failures.append(f"{_page} scroll does not move content")
+        print(f"{'PASS' if visible else 'FAIL'}  {_page}: {_button} reachable after scrolling")
+        if not visible: failures.append(f"{_page}: {_button} still unreachable")
 
-    canvas.yview_moveto(0.0); app.update_idletasks()
-except Exception as exc:
-    failures.append(f"scroll reveal: {exc}"); print(f"FAIL  scroll reveal: {exc}"); traceback.print_exc()
+        canvas.yview_moveto(0.0); app.update_idletasks()
+    except Exception as exc:
+        failures.append(f"{_page} scroll reveal: {exc}")
+        print(f"FAIL  {_page} scroll reveal: {exc}"); traceback.print_exc()
 
 # ---- functional: create the AFK command the way the UI does ----------
 import time as _t
@@ -264,6 +268,125 @@ try:
     if not good: failures.append("set system")
 except Exception as exc:
     failures.append(f"grammar: {exc}"); print(f"FAIL  grammar: {exc}"); traceback.print_exc()
+
+# ---- functional: wake word mode --------------------------------------
+try:
+    for name in ("wake_enabled_var", "wake_phrases_var", "wake_sleep_var",
+                 "wake_enter_var", "wake_reply_var"):
+        ok = hasattr(app, name)
+        print(f"{'PASS' if ok else 'FAIL'}  widget {name}")
+        if not ok: failures.append(f"missing widget {name}")
+
+    cfg = app._wake_settings()
+    good = ("computer turn voice on" in cfg["phrases"]
+            and "computer start listening" in cfg["phrases"])
+    print(f"{'PASS' if good else 'FAIL'}  default wake phrases {cfg['phrases']}")
+    if not good: failures.append("wake phrase defaults")
+
+    good = "voice off" in cfg["sleep_phrases"]
+    print(f"{'PASS' if good else 'FAIL'}  default sleep phrases {cfg['sleep_phrases']}")
+    if not good: failures.append("sleep phrase defaults")
+
+    good = cfg["enter_response"] == "Entering wake word mode." and cfg["wake_response"] == "Standing by."
+    print(f"{'PASS' if good else 'FAIL'}  default replies "
+          f"{cfg['enter_response']!r} / {cfg['wake_response']!r}")
+    if not good: failures.append("wake reply defaults")
+
+    # Matching, including the politeness the recogniser adds.
+    for heard, phrases, expect in [
+            ("voice off", cfg["sleep_phrases"], True),
+            ("computer voice off", cfg["sleep_phrases"], True),
+            ("shields front", cfg["sleep_phrases"], False),
+            ("computer start listening", cfg["phrases"], True),
+            ("okay computer turn voice on please", cfg["phrases"], True),
+            ("plot a course to lorville", cfg["phrases"], False)]:
+        got = app._phrase_in(heard, phrases)
+        good = got == expect
+        print(f"{'PASS' if good else 'FAIL'}  match {heard!r} -> {got}")
+        if not good: failures.append(f"wake match {heard}")
+
+    # The state machine, driven the way the listen loop drives it.
+    spoken = []
+    app._speak = lambda text="", force=False: spoken.append(text)
+    app.running = True
+
+    app.wake_mode = False
+    app._enter_wake_mode()
+    good = app.wake_mode and spoken[-1] == "Entering wake word mode."
+    print(f"{'PASS' if good else 'FAIL'}  sleep -> wake_mode={app.wake_mode}, said {spoken[-1]!r}")
+    if not good: failures.append("enter wake mode")
+
+    app._set_status()
+    label = app.status_label.cget("text")
+    good = label == "WAKE WORD MODE"
+    print(f"{'PASS' if good else 'FAIL'}  status reads {label!r} while asleep")
+    if not good: failures.append(f"status while asleep: {label}")
+
+    app._leave_wake_mode()
+    app._set_status()
+    good = (not app.wake_mode) and spoken[-1] == "Standing by." and app.status_label.cget("text") == "LISTENING"
+    print(f"{'PASS' if good else 'FAIL'}  wake -> awake, said {spoken[-1]!r}, status {app.status_label.cget('text')!r}")
+    if not good: failures.append("leave wake mode")
+
+    # start_listening must never come up asleep.
+    app.wake_mode = True
+    app.running = False
+    app.selected_device = "__default__"
+    try:
+        app.start_listening()
+    except Exception:
+        pass
+    good = not app.wake_mode
+    print(f"{'PASS' if good else 'FAIL'}  start_listening comes up awake")
+    if not good: failures.append("start_listening left wake mode on")
+    app.running = False
+
+    # Round-trip through settings.json.
+    app.wake_sleep_var.set("sleep now, quiet mode")
+    app.wake_reply_var.set("Ready when you are.")
+    app._save_settings()
+    cfg = app._wake_settings()
+    good = cfg["sleep_phrases"] == ["sleep now", "quiet mode"] and cfg["wake_response"] == "Ready when you are."
+    print(f"{'PASS' if good else 'FAIL'}  edits round-trip: {cfg['sleep_phrases']} / {cfg['wake_response']!r}")
+    if not good: failures.append("wake settings round-trip")
+
+    # An empty phrase list would be a mode you cannot wake from.
+    app.wake_phrases_var.set("   ")
+    app._save_settings()
+    cfg = app._wake_settings()
+    good = cfg["phrases"] == list(mod.WAKE_PHRASES)
+    print(f"{'PASS' if good else 'FAIL'}  blank wake phrases fall back to defaults")
+    if not good: failures.append("blank wake phrases not defaulted")
+except Exception as exc:
+    failures.append(f"wake word: {exc}")
+    print(f"FAIL  wake word: {exc}"); traceback.print_exc()
+
+# ---- the listen loop must check things in the right order ------------
+try:
+    import inspect as _inspect
+    src = _inspect.getsource(mod.VoiceKeybindApp._listen_loop)
+    markers = [
+        ("wake gate",        "if self.wake_mode:"),
+        ("sleep phrase",     'self._enter_wake_mode(wake)'),
+        ("hard voice-off",   "VOICE_OFF_PHRASES"),
+        ("repeat cancel",    "_repeat_cancel_match"),
+        ("stop repeating",   "REPEAT_STOP_ALL_PHRASES"),
+        ("star map",         "_handle_starmap_speech"),
+        ("keybind matcher",  "_build_phrase_matcher()"),
+    ]
+    positions = [(name, src.find(needle)) for name, needle in markers]
+    missing = [name for name, pos in positions if pos < 0]
+    if missing:
+        failures.append(f"listen loop missing: {missing}")
+        print(f"FAIL  listen loop is missing {missing}")
+    else:
+        ordered = all(a[1] < b[1] for a, b in zip(positions, positions[1:]))
+        print(f"{'PASS' if ordered else 'FAIL'}  listen loop order: "
+              + " -> ".join(name for name, _ in positions))
+        if not ordered:
+            failures.append("listen loop order wrong")
+except Exception as exc:
+    failures.append(f"listen order: {exc}"); print(f"FAIL  listen order: {exc}")
 
 # ---- functional: phrases resolve to the action they name -------------
 try:

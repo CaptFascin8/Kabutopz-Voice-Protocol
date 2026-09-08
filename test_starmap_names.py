@@ -136,6 +136,28 @@ def test_row_picking_still_matches():
     print(f"          reason: {why}")
 
 
+def test_lowercase_search():
+    print("\n7. The destination is typed without shift")
+    check("lowercase_search defaults on",
+          starmap.DEFAULT_SETTINGS.get("lowercase_search"), True)
+
+    # "HUR-L5" needs shift for three letters; "hur-l5" needs none, which is
+    # what stops the game reading "-" and "5" as "_" and "%".
+    for name in ["HUR-L5", "CRU-L5", "Lorville", "Grim Hex", "microTech"]:
+        typed = name.lower()
+        check(f"{name!r} types as {typed!r} (no capitals)",
+              any(c.isupper() for c in typed), False)
+
+    # Every comparison downstream is case-insensitive, so nothing else cares.
+    check("_key is case-insensitive",
+          starmap._key("HUR-L5") == starmap._key("hur-l5"), True)
+    rows = [{"text": "HUR-L5 HIGH COURSE STATION", "system": "Stanton",
+             "has_distance": True, "line": {}}]
+    row, _ = starmap.pick_row(rows, "hur-l5", "Stanton")
+    check("a lower-case destination still matches an upper-case row",
+          row["text"] if row else None, "HUR-L5 HIGH COURSE STATION")
+
+
 def main():
     print("Kabutopz Voice Protocol — destination naming tests")
     test_spelled_out_names()
@@ -144,6 +166,7 @@ def main():
     test_search_queries()
     test_spoken_form()
     test_row_picking_still_matches()
+    test_lowercase_search()
 
     print()
     if FAILURES:

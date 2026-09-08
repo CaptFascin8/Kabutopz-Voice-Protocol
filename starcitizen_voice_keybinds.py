@@ -291,6 +291,26 @@ VOICE_OFF_PHRASES = {
     "computer disable",
 }
 
+# --- wake word mode ----------------------------------------------------
+#
+# VOICE_OFF_PHRASES above is the *hard* stop: it ends the listen thread, and
+# only the hotkey or the button brings it back. Wake word mode is the soft
+# version — the microphone stays open, everything is still transcribed into
+# the history, but nothing is acted on except the wake phrase. It is for
+# talking to people without your ship reacting to the conversation.
+WAKE_SLEEP_PHRASES = (
+    "voice off",
+    "computer voice off",
+    "go to sleep",
+    "computer go to sleep",
+)
+WAKE_PHRASES = (
+    "computer turn voice on",
+    "computer start listening",
+)
+WAKE_ENTER_RESPONSE = "Entering wake word mode."
+WAKE_RESPONSE = "Standing by."
+
 THANK_YOU_COMPUTER_PHRASES = {
     "thank you computer",
     "thanks computer",
@@ -705,6 +725,10 @@ class VoiceKeybindApp(tk.Tk):
         self.starmap_busy = threading.Lock()
         # (action_id) of the most recent match, so "repeat that" has a referent.
         self.last_action = None
+        # Wake word mode: still listening, deliberately not obeying. Read and
+        # written from the listen thread, so it stays a plain bool — nothing
+        # else touches it and a torn read is not possible for one.
+        self.wake_mode = False
         self.recognizer = sr.Recognizer()
         self.audio_devices = []
         self.selected_device = "__default__"
@@ -913,6 +937,7 @@ class VoiceKeybindApp(tk.Tk):
                         self.repeat_default_var.get()
                     ),
                 }
+            self._save_wake_settings()
             SETTINGS_FILE.write_text(
                 json.dumps(self.settings, indent=2),
                 encoding="utf-8"
@@ -2326,18 +2351,22 @@ class VoiceKeybindApp(tk.Tk):
         panel = self._panel(self.customize_page)
         panel.pack(fill="both", expand=True)
 
-        inner = self._track(tk.Frame(panel, bg=t["panel"]), "panel")
-        inner.pack(fill="both", expand=True, padx=28, pady=24)
+        # Scrollable: this page now carries the wake word block as well as the
+        # theme grid, which is more than fits at the minimum window size.
+        inner = self._scrollable(panel)
 
         self._label(
-            inner, "CUSTOMIZE UI", ("Segoe UI", 18, "bold")
+            inner, "CUSTOMIZE", ("Segoe UI", 18, "bold")
         ).pack(anchor="w")
         self._label(
             inner,
-            "Theme editing lives here so the Voice Protocol page stays clean.",
+            "Theme and voice behaviour live here so the Voice Protocol page "
+            "stays clean.",
             ("Segoe UI", 9),
             muted=True,
         ).pack(anchor="w", pady=(4, 22))
+
+        self._build_wake_word_block(inner)
 
         self._label(
             inner, "THEME PRESET",
@@ -2418,6 +2447,92 @@ class VoiceKeybindApp(tk.Tk):
             pady=10,
         )
         reset.pack(fill="x", pady=(22, 0))
+
+    def _build_wake_word_block(self, parent):
+        """Wake word mode settings, on the CUSTOMIZE page.
+
+        Deliberately not on the VOICE PROTOCOL page: that page is the one you
+        look at mid-flight, and it is already full. What you get there is the
+        status word changing to WAKE WORD MODE.
+        """
+        t = self.theme
+        config = self._wake_settings()
+
+        card = tk.Frame(
+            parent,
+            bg=t["panel2"],
+            highlightthickness=1,
+            highlightbackground=t["border"],
+        )
+        self._track(card, "panel2", "border")
+        card.pack(fill="x", pady=(0, 24))
+
+        self._label(
+            card, "WAKE WORD MODE", ("Segoe UI", 11, "bold"), panel2=True
+        ).pack(anchor="w", padx=16, pady=(14, 3))
+
+        self._label(
+            card,
+            "Say the sleep phrase and the microphone stays open but stops "
+            "obeying — only the wake phrase gets through. For talking to "
+            "people without your ship reacting.",
+            ("Segoe UI", 8), muted=True, panel2=True
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        self.wake_enabled_var = tk.BooleanVar(value=config["enabled"])
+        enable = tk.Checkbutton(
+            card,
+            text="ENABLE WAKE WORD MODE",
+            variable=self.wake_enabled_var,
+            command=self._save_settings,
+            bg=t["panel2"], fg=t["text"],
+            selectcolor=t["panel"],
+            activebackground=t["panel2"], activeforeground=t["text"],
+            font=("Segoe UI", 8, "bold"),
+        )
+        self._track(enable, "panel2", "text")
+        enable.pack(anchor="w", padx=12, pady=(0, 8))
+
+        form = self._track(tk.Frame(card, bg=t["panel2"]), "panel2")
+        form.pack(fill="x", padx=16, pady=(0, 14))
+        form.grid_columnconfigure(0, weight=1)
+        form.grid_columnconfigure(1, weight=1)
+
+        fields = (
+            ("SLEEP PHRASES — comma separated",
+             "wake_sleep_var", ", ".join(config["sleep_phrases"]), 0, 0),
+            ("WAKE PHRASES — comma separated",
+             "wake_phrases_var", ", ".join(config["phrases"]), 0, 1),
+            ("REPLY WHEN GOING TO SLEEP",
+             "wake_enter_var", config["enter_response"], 2, 0),
+            ("REPLY WHEN WOKEN",
+             "wake_reply_var", config["wake_response"], 2, 1),
+        )
+
+        for label, attr, value, row, column in fields:
+            self._label(
+                form, label, ("Segoe UI", 8, "bold"), muted=True, panel2=True
+            ).grid(
+                row=row, column=column, sticky="w", pady=(0, 5),
+                padx=(0, 8) if column == 0 else (8, 0),
+            )
+
+            var = tk.StringVar(value=value)
+            setattr(self, attr, var)
+            entry = tk.Entry(
+                form, textvariable=var,
+                bg=t["panel"], fg=t["text"], insertbackground=t["text"],
+                relief="flat", bd=0, font=("Cascadia Mono", 10)
+            )
+            self._track(entry, "panel", "text")
+            entry.grid(
+                row=row + 1, column=column, sticky="ew", ipady=7,
+                pady=(0, 12),
+                padx=(0, 8) if column == 0 else (8, 0),
+            )
+            # Save on leaving the field rather than on every keystroke.
+            entry.bind("<FocusOut>", lambda _event: self._save_settings())
+            entry.bind("<Return>", lambda _event: self._save_settings())
 
     # -------------------- Phrases page --------------------
     def _build_phrases_page(self):
@@ -4927,7 +5042,12 @@ class VoiceKeybindApp(tk.Tk):
 
     def _set_status(self):
         if self.running:
-            self.status_label.configure(text="LISTENING")
+            # Asleep is a third state, not a flavour of listening. Saying
+            # LISTENING while the app is deliberately ignoring you is the
+            # kind of small lie that costs ten minutes of confusion.
+            self.status_label.configure(
+                text="WAKE WORD MODE" if self.wake_mode else "LISTENING"
+            )
             self.listen_button.configure(
                 text="STOP LISTENING",
                 bg=self.RED,
@@ -5045,6 +5165,9 @@ class VoiceKeybindApp(tk.Tk):
             return
 
         self.running = True
+        # Always come up awake. Starting into a mode where nothing responds,
+        # with no memory of how it got there, is a bad first five seconds.
+        self.wake_mode = False
         self._set_status()
         self._history_add(
             "Voice control started. Commands are active immediately."
@@ -5551,6 +5674,74 @@ class VoiceKeybindApp(tk.Tk):
             )
         return True
 
+    # ---- wake word mode -------------------------------------------------
+    def _wake_settings(self):
+        """Current wake word configuration, with defaults filled in."""
+        saved = self.settings.get("wake_word", {})
+        if not isinstance(saved, dict):
+            saved = {}
+
+        def phrases(key, fallback):
+            cleaned = self._clean_phrase_list(saved.get(key, list(fallback)))
+            return cleaned or list(fallback)
+
+        return {
+            "enabled": bool(saved.get("enabled", True)),
+            "phrases": phrases("phrases", WAKE_PHRASES),
+            "sleep_phrases": phrases("sleep_phrases", WAKE_SLEEP_PHRASES),
+            "enter_response": str(
+                saved.get("enter_response") or WAKE_ENTER_RESPONSE
+            ),
+            "wake_response": str(saved.get("wake_response") or WAKE_RESPONSE),
+        }
+
+    def _save_wake_settings(self):
+        """Fold the wake word UI fields back into settings.json.
+
+        Empty phrase fields fall back to the defaults rather than saving an
+        empty list — a wake word mode you cannot wake from would be a trap.
+        """
+        if not hasattr(self, "wake_enabled_var"):
+            return
+
+        phrases = self._clean_phrase_list(self.wake_phrases_var.get())
+        sleep = self._clean_phrase_list(self.wake_sleep_var.get())
+
+        self.settings["wake_word"] = {
+            "enabled": bool(self.wake_enabled_var.get()),
+            "phrases": phrases or list(WAKE_PHRASES),
+            "sleep_phrases": sleep or list(WAKE_SLEEP_PHRASES),
+            "enter_response": (
+                self.wake_enter_var.get().strip() or WAKE_ENTER_RESPONSE
+            ),
+            "wake_response": (
+                self.wake_reply_var.get().strip() or WAKE_RESPONSE
+            ),
+        }
+
+    @staticmethod
+    def _phrase_in(heard, phrases):
+        """True when any phrase appears in what was heard.
+
+        Containment rather than equality, because the recogniser adds
+        politeness: "okay computer start listening" should still wake it.
+        The phrases are long enough that false positives are unlikely.
+        """
+        text = str(heard).lower().strip(" ,.!?-")
+        return any(phrase in text for phrase in phrases if phrase)
+
+    def _enter_wake_mode(self, config=None):
+        config = config or self._wake_settings()
+        self.wake_mode = True
+        self._speak(config["enter_response"], force=True)
+        self.events.put(("wake_mode", "on"))
+
+    def _leave_wake_mode(self, config=None):
+        config = config or self._wake_settings()
+        self.wake_mode = False
+        self._speak(config["wake_response"], force=True)
+        self.events.put(("wake_mode", "off"))
+
     def _repeat_cancel_match(self, heard):
         """Return the action_id whose stop phrase matches, if any.
 
@@ -5720,6 +5911,23 @@ class VoiceKeybindApp(tk.Tk):
                     if self._voice_stop_talking_match(heard):
                         self._stop_tts()
                         self.events.put(("info", "TTS stopped by voice command."))
+                        continue
+
+                    # Wake word mode. The microphone stays open and every
+                    # word still reaches the history, but the wake phrase is
+                    # the only thing acted on — that is the entire point, so
+                    # this gate sits above everything, including the hard
+                    # voice-off and a running repeat's stop phrase.
+                    wake = self._wake_settings()
+                    if self.wake_mode:
+                        if self._phrase_in(normalized, wake["phrases"]):
+                            self._leave_wake_mode(wake)
+                        continue
+
+                    if wake["enabled"] and self._phrase_in(
+                        normalized, wake["sleep_phrases"]
+                    ):
+                        self._enter_wake_mode(wake)
                         continue
 
                     # Hard voice-off.
@@ -6024,6 +6232,15 @@ class VoiceKeybindApp(tk.Tk):
                     self._history_add(f"Ship weapon locations: {answer}")
                 elif kind == "ship_weapon_voice_error":
                     self._history_add(value, "error")
+                elif kind == "wake_mode":
+                    self._set_status()
+                    if value == "on":
+                        self._history_add(
+                            "Wake word mode — listening, but only for the "
+                            "wake phrase."
+                        )
+                    else:
+                        self._history_add("Wake word heard. Commands active.")
                 elif kind == "voice_off":
                     self.running = False
                     self.repeats.stop_all(announce=False)

@@ -67,6 +67,19 @@ DEFAULT_SETTINGS = {
     "press_enter_after_click": False,
     "verify_route": True,
     "type_interval": 0.04,
+
+    # Type the destination in lower case.
+    #
+    # "HUR-L5" reached the search field as "HUR_L%": every capital needs
+    # shift, and the game samples modifier state per frame, so the unshifted
+    # "-" and "5" could be read while shift was still considered down.
+    # Lower case needs no shift at all for a name like "hur-l5", which
+    # removes the whole class of failure rather than tuning its timing.
+    #
+    # Safe because the game's search is case-insensitive and its field
+    # renders upper case regardless, and because every comparison in this
+    # module already runs through _key(), which lower-cases.
+    "lowercase_search": True,
 }
 
 MODE_DEFAULT = "DEFAULT"
@@ -710,9 +723,14 @@ class StarMapController:
         field back turns that silent failure into a retry.
         """
         attempts = self.settings["search_attempts"]
+        typed_form = (
+            str(destination).lower()
+            if self.settings.get("lowercase_search", True)
+            else destination
+        )
 
         for attempt in range(1, attempts + 1):
-            wi.type_text(destination, interval=self.settings["type_interval"])
+            wi.type_text(typed_form, interval=self.settings["type_interval"])
             time.sleep(self.settings["delay_type"])
 
             text, data = self.read_search_field()
