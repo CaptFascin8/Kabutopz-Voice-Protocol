@@ -52,6 +52,18 @@ if exist "dist\KabutopzVoiceProtocol\_internal\PIL\_imagingcms.cp314-win_amd64.p
 if exist "dist\KabutopzVoiceProtocol\_internal\PIL\_imagingmath.cp314-win_amd64.pyd" del /q "dist\KabutopzVoiceProtocol\_internal\PIL\_imagingmath.cp314-win_amd64.pyd"
 if exist "dist\KabutopzVoiceProtocol\_internal\PIL\_webp.cp314-win_amd64.pyd" del /q "dist\KabutopzVoiceProtocol\_internal\PIL\_webp.cp314-win_amd64.pyd"
 
+rem The Voice Forge sidecar is deliberately NOT bundled - it needs
+rem PyTorch, which would take the build from 40 MB to over 2 GB. Its
+rem scripts are copied beside the exe so a release is self-contained;
+rem the user runs setup_voice_forge.bat there to create the environment,
+rem and the app works with the Windows voice until they do.
+if exist "voice_forge" (
+    if not exist "dist\KabutopzVoiceProtocol\voice_forge" mkdir "dist\KabutopzVoiceProtocol\voice_forge"
+    copy /y "voice_forge\*.py" "dist\KabutopzVoiceProtocol\voice_forge\" >nul
+    copy /y "voice_forge\*.bat" "dist\KabutopzVoiceProtocol\voice_forge\" >nul
+    echo Voice Forge scripts copied beside the exe.
+)
+
 certutil -hashfile "dist\KabutopzVoiceProtocol\KabutopzVoiceProtocol.exe" SHA256 > "dist\KabutopzVoiceProtocol\SHA256.txt"
 
 echo.

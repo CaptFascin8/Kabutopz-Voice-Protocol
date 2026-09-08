@@ -13,13 +13,15 @@ import queue
 import random
 import re
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, messagebox, colorchooser
+from tkinter import ttk, messagebox, colorchooser, filedialog
 from pathlib import Path
 
 import sounddevice as sd
@@ -27,6 +29,7 @@ import speech_recognition as sr
 
 import starmap as starmap_module
 import win_ocr
+import voice_clones
 
 from win_input import (
     GlobalHotkey,
@@ -60,8 +63,8 @@ COMMAND_MAX_CAPTURE_SECONDS = 2.6
 COMMAND_PREROLL_CHUNKS = 8
 PAGE_ORDER = (
     "VOICE PROTOCOL", "HOW TO", "CUSTOMIZE", "PHRASES", "KEYBINDS",
-    "CUSTOM WORDS", "STAR MAP", "COMPONENTS", "SHIP WEAPONS",
-    "COMMODITIES", "MINING MODE", "SHIP FINDER",
+    "CUSTOM WORDS", "STAR MAP", "VOICE CLONES", "COMPONENTS",
+    "SHIP WEAPONS", "COMMODITIES", "MINING MODE", "SHIP FINDER",
     "GUIDES", "ANNOUNCEMENTS", "CREDIT",
 )
 
@@ -310,6 +313,20 @@ WAKE_PHRASES = (
 )
 WAKE_ENTER_RESPONSE = "Entering wake word mode."
 WAKE_RESPONSE = "Standing by."
+
+# --- cloned voices -----------------------------------------------------
+#
+# "switch to ship computer voice", "computer athena voice", "use the
+# windows voice". The name is whatever sits between the verb and the word
+# "voice", because that is the part the pilot chose and the part the
+# recogniser is least likely to mangle into something else.
+VOICE_SWITCH_PATTERN = re.compile(
+    r"\b(?:switch to|change to|use|computer)\s+(?:the\s+)?"
+    r"(?P<name>.+?)\s+voice\b",
+    re.IGNORECASE,
+)
+# Systems the star map can warn about, expanded into the render catalogue.
+VOICE_CATALOG_SYSTEMS = ("Stanton", "Pyro", "Nyx", "Terra")
 
 THANK_YOU_COMPUTER_PHRASES = {
     "thank you computer",
@@ -729,6 +746,10 @@ class VoiceKeybindApp(tk.Tk):
         # written from the listen thread, so it stays a plain bool — nothing
         # else touches it and a torn read is not possible for one.
         self.wake_mode = False
+        # The cloned voice in use, or None for the Windows voice. Resolved
+        # after settings load, below.
+        self.active_voice = None
+        self.voice_render_thread = None
         self.recognizer = sr.Recognizer()
         self.audio_devices = []
         self.selected_device = "__default__"
@@ -750,6 +771,7 @@ class VoiceKeybindApp(tk.Tk):
         self._load_custom_actions_into_registry()
         self.phrases = self._load_phrases()
         self.keybinds = self._load_keybinds()
+        self.active_voice = self._load_active_voice()
         self._create_starmap_controller()
 
         self.tracked = {
@@ -775,6 +797,7 @@ class VoiceKeybindApp(tk.Tk):
         self._build_custom_words_page()
         self._build_keybinds_page()
         self._build_starmap_page()
+        self._build_voice_clones_page()
         self._build_mining_page()
         self._build_ship_finder_page()
         self._build_guides_page()
@@ -1447,6 +1470,7 @@ class VoiceKeybindApp(tk.Tk):
             "KEYBINDS": "KEYBINDS",
             "CUSTOM WORDS": "CUSTOM WORDS",
             "STAR MAP": "STAR MAP",
+            "VOICE CLONES": "VOICES",
             "COMMODITIES": "COMMODITIES",
             "COMPONENTS": "COMPONENTS",
             "SHIP WEAPONS": "SHIP WEAPONS",
@@ -2533,6 +2557,489 @@ class VoiceKeybindApp(tk.Tk):
             # Save on leaving the field rather than on every keystroke.
             entry.bind("<FocusOut>", lambda _event: self._save_settings())
             entry.bind("<Return>", lambda _event: self._save_settings())
+
+    # ==================== Voice Clones page ====================
+    def _voice_forge_dir(self):
+        """Where the sidecar lives.
+
+        Never bundled into the exe — it is 2 GB of PyTorch — so it has to
+        be found rather than assumed. A release has it beside the
+        executable; a source tree has it beside this file; and a build
+        run from inside a checkout has the exe two levels down in dist\\,
+        with the environment still installed up at the root.
+
+        A folder that already has an environment wins over one that does
+        not, so an installed sidecar is used in preference to an empty
+        copy that happens to sit closer.
+        """
+        candidates = []
+        if getattr(sys, "frozen", False):
+            exe = Path(sys.executable).resolve().parent
+            candidates += [
+                exe / "voice_forge",
+                exe.parent / "voice_forge",              # dist\\
+                exe.parent.parent / "voice_forge",       # the checkout
+            ]
+        candidates.append(Path(__file__).resolve().parent / "voice_forge")
+
+        installed = [
+            path for path in candidates
+            if (path / ".venv" / "Scripts" / "python.exe").is_file()
+        ]
+        if installed:
+            return installed[0]
+
+        for path in candidates:
+            if path.is_dir():
+                return path
+        return candidates[0]
+
+    def _voice_forge_python(self):
+        """The sidecar's interpreter, or None when it is not installed."""
+        candidate = self._voice_forge_dir() / ".venv" / "Scripts" / "python.exe"
+        return candidate if candidate.is_file() else None
+
+    def _voice_catalog(self):
+        """Every line worth rendering, including the pilot's own replies."""
+        destinations = sorted(set(
+            starmap_module.DESTINATION_ALIASES.values()
+        ))
+        return voice_clones.line_catalog(
+            destinations=destinations,
+            systems=VOICE_CATALOG_SYSTEMS,
+            extra=voice_clones.custom_replies(self.settings),
+        )
+
+    def _build_voice_clones_page(self):
+        t = self.theme
+        self.voice_clones_page = self._track(
+            tk.Frame(self.page_host, bg=t["bg"]), "bg"
+        )
+
+        panel = self._panel(self.voice_clones_page)
+        panel.pack(fill="both", expand=True)
+
+        inner = self._scrollable(panel)
+
+        self._label(
+            inner, "VOICE CLONES", ("Segoe UI", 18, "bold")
+        ).pack(anchor="w")
+        self._label(
+            inner,
+            "Give the ship computer a voice of your own. Record or import "
+            "about ten seconds of clean speech, then every line it can say "
+            "is rendered once and played from disk — nothing runs while "
+            "you fly.",
+            ("Segoe UI", 9), muted=True,
+        ).pack(anchor="w", pady=(4, 6))
+
+        self.voice_forge_status = self._label(
+            inner, "", ("Segoe UI", 8, "bold"), muted=True
+        )
+        self.voice_forge_status.pack(anchor="w", pady=(0, 18))
+
+        # ---- existing voices ----
+        self._label(
+            inner, "YOUR VOICES", ("Segoe UI", 8, "bold"), muted=True
+        ).pack(anchor="w", pady=(0, 5))
+
+        self.voice_clone_list = tk.Listbox(
+            inner, height=5,
+            bg=t["panel2"], fg=t["text"],
+            selectbackground=t["border"], selectforeground=t["text"],
+            relief="flat", bd=0, activestyle="none",
+            font=("Cascadia Mono", 9), highlightthickness=0,
+        )
+        self._track(self.voice_clone_list, "panel2", "text")
+        self.voice_clone_list.pack(fill="x", pady=(0, 8))
+
+        row = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        row.pack(fill="x", pady=(0, 22))
+        for text, command, colour in (
+            ("USE THIS VOICE", self._use_selected_voice, "accent"),
+            ("TEST", self._test_selected_voice, "panel2"),
+            ("RENDER MISSING LINES", self._render_selected_voice, "panel2"),
+            ("DELETE", self._delete_selected_voice, "red"),
+        ):
+            if colour == "accent":
+                bg, fg = t["accent"], self._accent_text_color(t["accent"])
+            elif colour == "red":
+                bg, fg = self.RED, "#ffffff"
+            else:
+                bg, fg = t["panel2"], t["text"]
+
+            button = tk.Button(
+                row, text=text, command=command,
+                bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+                relief="flat", bd=0, font=("Segoe UI", 8, "bold"), pady=7,
+            )
+            if colour == "panel2":
+                self._track(button, "panel2", "text")
+            button.pack(side="left", fill="x", expand=True, padx=3)
+
+        # ---- make a new one ----
+        self._label(
+            inner, "CREATE A VOICE", ("Segoe UI", 11, "bold")
+        ).pack(anchor="w", pady=(0, 8))
+
+        name_row = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        name_row.pack(fill="x", pady=(0, 12))
+
+        self._label(
+            name_row, "NAME", ("Segoe UI", 8, "bold"), muted=True
+        ).pack(side="left", padx=(0, 10))
+
+        self.voice_name_var = tk.StringVar()
+        name_entry = tk.Entry(
+            name_row, textvariable=self.voice_name_var,
+            bg=t["panel2"], fg=t["text"], insertbackground=t["text"],
+            relief="flat", bd=0, font=("Cascadia Mono", 10),
+        )
+        self._track(name_entry, "panel2", "text")
+        name_entry.pack(side="left", fill="x", expand=True, ipady=7)
+
+        self._label(
+            inner,
+            "Say the name the way you will speak it: “switch to "
+            "<name> voice”.",
+            ("Segoe UI", 8), muted=True,
+        ).pack(anchor="w", pady=(0, 14))
+
+        source_row = self._track(tk.Frame(inner, bg=t["panel"]), "panel")
+        source_row.pack(fill="x", pady=(0, 10))
+
+        self.voice_record_button = tk.Button(
+            source_row, text=f"RECORD {int(voice_clones.RECORD_SECONDS)} SECONDS",
+            command=self._record_voice_reference,
+            bg=t["accent"], fg=self._accent_text_color(t["accent"]),
+            activebackground=t["accent"],
+            activeforeground=self._accent_text_color(t["accent"]),
+            relief="flat", bd=0, font=("Segoe UI", 9, "bold"), pady=10,
+        )
+        self.voice_record_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        import_button = tk.Button(
+            source_row, text="IMPORT A WAV FILE",
+            command=self._import_voice_reference,
+            bg=t["panel2"], fg=t["text"],
+            activebackground=t["border"], activeforeground=t["text"],
+            relief="flat", bd=0, font=("Segoe UI", 9, "bold"), pady=10,
+        )
+        self._track(import_button, "panel2", "text")
+        import_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        self.voice_script_label = self._label(
+            inner,
+            "Read this while recording, in your normal speaking voice:\n\n"
+            + voice_clones.RECORDING_SCRIPT,
+            ("Cascadia Mono", 9), muted=True,
+        )
+        self.voice_script_label.pack(anchor="w", pady=(0, 14))
+
+        self.voice_progress_label = self._label(
+            inner, "", ("Segoe UI", 9, "bold")
+        )
+        self.voice_progress_label.pack(anchor="w", pady=(0, 20))
+
+        self._refresh_voice_clones()
+
+    # ---- page state -----------------------------------------------------
+    def _refresh_voice_clones(self):
+        if not hasattr(self, "voice_clone_list"):
+            return
+
+        self.voice_clone_list.delete(0, tk.END)
+        self.voice_clone_rows = voice_clones.list_voices(APP_DIR)
+
+        active_slug = self.active_voice.slug if self.active_voice else None
+        self.voice_clone_list.insert(
+            tk.END,
+            ("> " if active_slug is None else "  ")
+            + "Windows voice (no clone)"
+        )
+        for voice in self.voice_clone_rows:
+            marker = "> " if voice.slug == active_slug else "  "
+            self.voice_clone_list.insert(tk.END, marker + voice.as_row())
+
+        if hasattr(self, "voice_forge_status"):
+            python = self._voice_forge_python()
+            if python is None:
+                self.voice_forge_status.configure(
+                    text="Voice Forge is not installed — run "
+                         "voice_forge\\setup_voice_forge.bat to enable "
+                         "rendering. Existing voices still play."
+                )
+            else:
+                self.voice_forge_status.configure(
+                    text="Voice Forge ready."
+                )
+
+    def _selected_voice(self):
+        """The highlighted voice, or None for the Windows-voice row."""
+        selection = self.voice_clone_list.curselection()
+        if not selection:
+            return None
+        index = selection[0]
+        if index == 0:
+            return None
+        rows = getattr(self, "voice_clone_rows", [])
+        return rows[index - 1] if index - 1 < len(rows) else None
+
+    def _use_selected_voice(self):
+        if not self.voice_clone_list.curselection():
+            messagebox.showinfo("Voice Clones", "Pick a voice from the list.")
+            return
+        self._set_active_voice(self._selected_voice())
+
+    def _test_selected_voice(self):
+        voice = self._selected_voice()
+        if voice is None:
+            self._speak("Voice calibrated.", force=True)
+            return
+        clip = voice.clip_for("Voice calibrated.")
+        if clip is None:
+            messagebox.showinfo(
+                "Voice Clones",
+                f"{voice.name} has no rendered lines yet.\n\n"
+                "Use RENDER MISSING LINES first."
+            )
+            return
+        voice_clones.stop()
+        voice_clones.play(clip)
+
+    def _delete_selected_voice(self):
+        voice = self._selected_voice()
+        if voice is None:
+            messagebox.showinfo(
+                "Voice Clones", "The Windows voice cannot be deleted."
+            )
+            return
+        if not messagebox.askyesno(
+            "Delete Voice",
+            f"Delete {voice.name} and all {voice.rendered_count()} of its "
+            f"rendered lines?\n\nThis cannot be undone."
+        ):
+            return
+        if self.active_voice and self.active_voice.slug == voice.slug:
+            self._set_active_voice(None, announce=False)
+        voice_clones.delete_voice(APP_DIR, voice.slug)
+        self._history_add(f"Deleted the {voice.name} voice.")
+        self._refresh_voice_clones()
+
+    # ---- getting a reference recording ----------------------------------
+    def _record_voice_reference(self):
+        """Record from the configured microphone, straight to a WAV.
+
+        Uses sounddevice, which the app already depends on, so recording
+        costs nothing extra. It runs on a thread with the button disabled:
+        a twelve-second blocking call on the UI thread would freeze the
+        window and look like a crash.
+        """
+        name = self.voice_name_var.get().strip()
+        if not name:
+            messagebox.showinfo("Voice Clones", "Name the voice first.")
+            return
+
+        if not messagebox.askyesno(
+            "Record",
+            f"Record {voice_clones.RECORD_SECONDS:.0f} seconds from your "
+            f"microphone?\n\nRead the script on the page in your normal "
+            f"speaking voice. Somewhere quiet — room echo and background "
+            f"noise get cloned along with you."
+        ):
+            return
+
+        self.voice_record_button.configure(state="disabled")
+
+        def worker():
+            try:
+                frames = int(
+                    voice_clones.RECORD_SECONDS * voice_clones.RECORD_SAMPLE_RATE
+                )
+                kwargs = {
+                    "samplerate": voice_clones.RECORD_SAMPLE_RATE,
+                    "channels": voice_clones.RECORD_CHANNELS,
+                    "dtype": "int16",
+                }
+                if self.selected_device not in (None, "__default__"):
+                    kwargs["device"] = self.selected_device
+
+                self.events.put((
+                    "voice_progress",
+                    f"Recording {voice_clones.RECORD_SECONDS:.0f}s — speak now.",
+                ))
+                audio = sd.rec(frames, **kwargs)
+                sd.wait()
+
+                scratch = APP_DIR / "voice_take.wav"
+                voice_clones.write_wav(scratch, audio.tobytes())
+                self.events.put(("voice_recorded", str(scratch)))
+            except Exception as exc:
+                self.events.put(("voice_error", f"Recording failed: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _import_voice_reference(self):
+        name = self.voice_name_var.get().strip()
+        if not name:
+            messagebox.showinfo("Voice Clones", "Name the voice first.")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Choose a recording to clone from",
+            filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")],
+        )
+        if path:
+            self._create_voice_from(path)
+
+    def _create_voice_from(self, source):
+        """Trim the take, register the voice, then offer to render it."""
+        name = self.voice_name_var.get().strip()
+        prepared = APP_DIR / "voice_reference.wav"
+
+        try:
+            sys.path.insert(0, str(self._voice_forge_dir()))
+            import prepare_reference
+            report = prepare_reference.prepare(source, prepared)
+        except Exception as exc:
+            messagebox.showerror(
+                "Voice Clones",
+                f"Could not prepare that recording.\n\n{exc}"
+            )
+            return
+
+        try:
+            voice = voice_clones.create_voice(APP_DIR, name, prepared)
+        except ValueError as exc:
+            messagebox.showerror("Voice Clones", str(exc))
+            return
+        finally:
+            try:
+                prepared.unlink()
+            except Exception:
+                pass
+
+        self._history_add(
+            f"Created the {voice.name} voice from "
+            f"{report['clip_seconds']}s of speech."
+        )
+        self.voice_name_var.set("")
+        self._refresh_voice_clones()
+
+        if report["speech_ratio"] < 0.6:
+            messagebox.showwarning(
+                "Voice Clones",
+                f"That clip is {(1 - report['speech_ratio']) * 100:.0f}% "
+                f"silence.\n\nIt will still work, but a denser read with "
+                f"fewer pauses clones noticeably better."
+            )
+
+        if messagebox.askyesno(
+            "Voice Clones",
+            f"{voice.name} is ready.\n\nRender its lines now?\n\n"
+            f"About {len(self._voice_catalog())} lines. Minutes on a free "
+            f"graphics card, considerably longer on the CPU — and close "
+            f"Star Citizen first, a busy card is slower than no card."
+        ):
+            self._render_voice(voice)
+
+    # ---- rendering ------------------------------------------------------
+    def _render_selected_voice(self):
+        voice = self._selected_voice()
+        if voice is None:
+            messagebox.showinfo(
+                "Voice Clones", "Pick a cloned voice to render."
+            )
+            return
+        self._render_voice(voice)
+
+    def _render_voice(self, voice):
+        """Render whatever this voice is missing, in the sidecar."""
+        if self.voice_render_thread and self.voice_render_thread.is_alive():
+            messagebox.showinfo(
+                "Voice Clones", "A render is already running."
+            )
+            return
+
+        python = self._voice_forge_python()
+        if python is None:
+            messagebox.showinfo(
+                "Voice Clones",
+                "Voice Forge is not installed.\n\nRun "
+                "voice_forge\\setup_voice_forge.bat, then try again.\n\n"
+                "The app keeps working with the Windows voice either way."
+            )
+            return
+
+        pending = voice.pending(self._voice_catalog())
+        if not pending:
+            messagebox.showinfo(
+                "Voice Clones",
+                f"{voice.name} already has every line rendered."
+            )
+            return
+
+        script = self._voice_forge_dir() / "render_voice.py"
+
+        def worker():
+            scratch = tempfile.TemporaryDirectory(prefix="kvp-render-")
+            try:
+                lines_file = Path(scratch.name) / "lines.json"
+                lines_file.write_text(json.dumps(pending), encoding="utf-8")
+
+                process = subprocess.Popen(
+                    [str(python), "-u", str(script),
+                     "--voice", str(voice.path),
+                     "--lines", str(lines_file)],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+
+                for raw in process.stdout:
+                    raw = raw.strip()
+                    if not raw.startswith("{"):
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except ValueError:
+                        continue
+
+                    kind = event.get("event")
+                    if kind == "loading":
+                        self.events.put((
+                            "voice_progress",
+                            f"Loading the model on {event['device']}...",
+                        ))
+                    elif kind == "warning":
+                        self.events.put(("voice_error", event["message"]))
+                    elif kind == "line":
+                        self.events.put((
+                            "voice_progress",
+                            f"Rendering {event['index']} of {event['total']}"
+                            f" — {event['text']}",
+                        ))
+                    elif kind == "error":
+                        self.events.put(("voice_error", event["message"]))
+                    elif kind == "done":
+                        self.events.put((
+                            "voice_done",
+                            f"{voice.name}: {event['rendered']} lines "
+                            f"rendered in {event['seconds']:.0f}s"
+                            + (f", {event['failed']} failed"
+                               if event.get("failed") else ""),
+                        ))
+                process.wait()
+            except Exception as exc:
+                self.events.put(("voice_error", f"Render failed: {exc}"))
+            finally:
+                scratch.cleanup()
+
+        self.voice_render_thread = threading.Thread(target=worker, daemon=True)
+        self.voice_render_thread.start()
+        self._history_add(
+            f"Rendering {len(pending)} lines for {voice.name}."
+        )
 
     # -------------------- Phrases page --------------------
     def _build_phrases_page(self):
@@ -4987,6 +5494,65 @@ class VoiceKeybindApp(tk.Tk):
             )
         self._save_settings()
 
+    # ---- cloned voices --------------------------------------------------
+    def _load_active_voice(self):
+        """Resolve the saved active voice, or None for the Windows voice."""
+        slug = str(self.settings.get("active_voice", "") or "").strip()
+        if not slug:
+            return None
+        return voice_clones.find_voice(APP_DIR, slug)
+
+    def _set_active_voice(self, voice, announce=True):
+        """Switch voices. The confirmation is spoken *in the new voice*.
+
+        That is not a flourish: "Voice calibrated." is a rendered clip in
+        the voice you just chose, so hearing it is proof the switch landed
+        and that its clips are readable. If it comes out in the Windows
+        voice, something is wrong and you know immediately.
+        """
+        self.active_voice = voice
+        self.settings["active_voice"] = voice.slug if voice else ""
+        self._save_settings()
+
+        if hasattr(self, "voice_clone_list"):
+            self._refresh_voice_clones()
+
+        if announce:
+            if voice is None:
+                self._speak("Voice calibrated.", force=True)
+                self._history_add("Switched to the Windows voice.")
+            else:
+                self._speak("Voice calibrated.", force=True)
+                self._history_add(f"Switched to the {voice.name} voice.")
+
+    def _handle_voice_switch(self, heard):
+        """'switch to <name> voice' — returns True when it was handled."""
+        match = VOICE_SWITCH_PATTERN.search(heard)
+        if not match:
+            return False
+
+        spoken = match.group("name").strip()
+        if not spoken:
+            return False
+
+        if voice_clones.slugify(spoken) in ("windows", "default",
+                                            "windows-default", "normal"):
+            self._set_active_voice(None)
+            return True
+
+        voice = voice_clones.find_voice(APP_DIR, spoken)
+        if voice is None:
+            # Say the name back, so a mis-hear is obvious rather than
+            # looking like the feature is broken.
+            self._speak(f"I have no voice called {spoken}.", force=True)
+            self.events.put((
+                "error", f'No cloned voice matches "{spoken}".'
+            ))
+            return True
+
+        self._set_active_voice(voice)
+        return True
+
     def _stop_tts(self):
         """Immediately stop the current speech process."""
         with self.tts_lock:
@@ -5198,6 +5764,23 @@ class VoiceKeybindApp(tk.Tk):
     def _speak(self, phrase="Command confirmed.", force=False):
         if not force and not self.voice_feedback_var.get():
             return
+
+        # A cloned voice, when one is active and has this line rendered.
+        # Playing a file costs nothing and cannot stutter, which is the
+        # whole reason every line is rendered up front.
+        voice = self.active_voice
+        if voice is not None:
+            clip = voice.clip_for(phrase)
+            if clip is not None:
+                self._stop_tts()
+                voice_clones.stop()
+                if voice_clones.play(clip):
+                    return
+            else:
+                # Write down what we could not say, so the VOICE CLONES
+                # page can offer to render exactly the lines that came up
+                # rather than asking the pilot to guess.
+                voice.note_miss(phrase)
 
         def worker():
             # New speech interrupts old speech so answers do not pile up.
@@ -6054,6 +6637,10 @@ class VoiceKeybindApp(tk.Tk):
                         ).start()
                         continue
 
+                    # "switch to <name> voice"
+                    if self._handle_voice_switch(normalized):
+                        continue
+
                     # Mining location question.
                     mining_resource = self._extract_mining_location_question(heard)
                     if mining_resource:
@@ -6231,6 +6818,23 @@ class VoiceKeybindApp(tk.Tk):
                     self._display_ship_weapon_results(result)
                     self._history_add(f"Ship weapon locations: {answer}")
                 elif kind == "ship_weapon_voice_error":
+                    self._history_add(value, "error")
+                elif kind == "voice_progress":
+                    if hasattr(self, "voice_progress_label"):
+                        self.voice_progress_label.configure(text=value)
+                elif kind == "voice_recorded":
+                    if hasattr(self, "voice_record_button"):
+                        self.voice_record_button.configure(state="normal")
+                    self.voice_progress_label.configure(text="")
+                    self._create_voice_from(value)
+                elif kind == "voice_done":
+                    if hasattr(self, "voice_progress_label"):
+                        self.voice_progress_label.configure(text=value)
+                    self._refresh_voice_clones()
+                    self._history_add(value)
+                elif kind == "voice_error":
+                    if hasattr(self, "voice_record_button"):
+                        self.voice_record_button.configure(state="normal")
                     self._history_add(value, "error")
                 elif kind == "wake_mode":
                     self._set_status()

@@ -361,6 +361,102 @@ except Exception as exc:
     failures.append(f"wake word: {exc}")
     print(f"FAIL  wake word: {exc}"); traceback.print_exc()
 
+# ---- functional: cloned voices ---------------------------------------
+try:
+    import voice_clones as _vc, struct as _struct
+
+    ok = hasattr(app, "voice_clone_list") and hasattr(app, "voice_name_var")
+    print(f"{'PASS' if ok else 'FAIL'}  VOICE CLONES page built")
+    if not ok: failures.append("voice clones page missing")
+
+    # Make a voice on disk the way the sidecar would leave it.
+    app_dir = mod.APP_DIR
+    ref = app_dir / "t.wav"
+    _vc.write_wav(ref, b"".join(_struct.pack("<h", 0) for _ in range(8 * 24000)))
+    made = _vc.create_voice(app_dir, "Ship Computer", ref)
+    for line in ["Voice calibrated.", "Command confirmed."]:
+        _vc.write_wav(made.clips_dir / f"{_vc.line_key(line)}.wav",
+                      b"".join(_struct.pack("<h", 0) for _ in range(24000)))
+
+    app._refresh_voice_clones()
+    rows = app.voice_clone_list.get(0, "end")
+    good = len(rows) == 2 and "Windows voice" in rows[0] and "Ship Computer" in rows[1]
+    print(f"{'PASS' if good else 'FAIL'}  list shows the Windows voice and the clone")
+    if not good: failures.append(f"voice list: {rows}")
+
+    # The spoken switch. Every phrasing a pilot might actually use.
+    spoken = []
+    app._speak = lambda text="", force=False: spoken.append(text)
+
+    for heard, expect in [("switch to ship computer voice", "ship-computer"),
+                          ("computer ship computer voice", "ship-computer"),
+                          ("use the ship computer voice", "ship-computer"),
+                          ("change to shipcomputer voice", "ship-computer")]:
+        app.active_voice = None
+        handled = app._handle_voice_switch(heard)
+        got = app.active_voice.slug if app.active_voice else None
+        good = handled and got == expect
+        print(f"{'PASS' if good else 'FAIL'}  \"{heard}\" -> {got}")
+        if not good: failures.append(f"switch {heard}")
+
+    good = spoken and spoken[-1] == "Voice calibrated."
+    print(f"{'PASS' if good else 'FAIL'}  switching says {spoken[-1]!r}")
+    if not good: failures.append("switch reply")
+
+    app._handle_voice_switch("switch to windows voice")
+    good = app.active_voice is None
+    print(f"{'PASS' if good else 'FAIL'}  \"switch to windows voice\" returns to the Windows voice")
+    if not good: failures.append("switch back to windows")
+
+    spoken.clear()
+    app._handle_voice_switch("switch to hal nine thousand voice")
+    good = spoken and "no voice called" in spoken[-1]
+    print(f"{'PASS' if good else 'FAIL'}  an unknown voice says so: {spoken[-1] if spoken else None!r}")
+    if not good: failures.append("unknown voice not reported")
+
+    # It must not eat ordinary commands.
+    for heard in ["plot a course to lorville", "shields front",
+                  "toggle quantum", "voice off"]:
+        good = not app._handle_voice_switch(heard)
+        print(f"{'PASS' if good else 'FAIL'}  \"{heard}\" is not a voice switch")
+        if not good: failures.append(f"switch swallowed {heard}")
+
+    # The active clone must be preferred over the Windows voice, and a
+    # line it does not have must be written down rather than lost.
+    played = []
+    real_play = _vc.play
+    _vc.play = lambda path: played.append(str(path)) or True
+    try:
+        app._speak = mod.VoiceKeybindApp._speak.__get__(app)
+        app.active_voice = _vc.find_voice(app_dir, "ship-computer")
+        app.active_voice.clear_misses()
+        app._speak("Voice calibrated.", force=True)
+        good = len(played) == 1
+        print(f"{'PASS' if good else 'FAIL'}  a rendered line plays from the clone")
+        if not good: failures.append("clone clip not played")
+
+        app._speak("Docking clamps released.", force=True)
+        misses = app.active_voice.logged_misses()
+        good = misses == ["Docking clamps released."]
+        print(f"{'PASS' if good else 'FAIL'}  an unrendered line is logged: {misses}")
+        if not good: failures.append(f"miss not logged: {misses}")
+    finally:
+        _vc.play = real_play
+        app._speak = lambda text="", force=False: None
+
+    # The catalogue must include the pilot's own replies.
+    cat = app._voice_catalog()
+    good = "Course set to Grim Hex." in cat and len(cat) > 100
+    print(f"{'PASS' if good else 'FAIL'}  catalogue has {len(cat)} lines incl. destinations")
+    if not good: failures.append("catalogue wrong")
+
+    good = app._voice_forge_dir().name == "voice_forge"
+    print(f"{'PASS' if good else 'FAIL'}  sidecar located at {app._voice_forge_dir().name}/")
+    if not good: failures.append("sidecar path")
+except Exception as exc:
+    failures.append(f"voice clones: {exc}")
+    print(f"FAIL  voice clones: {exc}"); traceback.print_exc()
+
 # ---- the listen loop must check things in the right order ------------
 try:
     import inspect as _inspect
@@ -372,6 +468,7 @@ try:
         ("repeat cancel",    "_repeat_cancel_match"),
         ("stop repeating",   "REPEAT_STOP_ALL_PHRASES"),
         ("star map",         "_handle_starmap_speech"),
+        ("voice switch",     "_handle_voice_switch"),
         ("keybind matcher",  "_build_phrase_matcher()"),
     ]
     positions = [(name, src.find(needle)) for name, needle in markers]
