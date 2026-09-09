@@ -82,6 +82,47 @@ RECORDING_SCRIPT = (
 )
 
 
+# --- variable text -----------------------------------------------------
+#
+# "Course set to Grim Hex. 1 minute, 23 seconds." is two different things
+# glued together: a sentence worth cloning, and a travel time that is
+# different every single flight. Rendering the pair is pointless — the
+# clip is used once and never matches again — and it is how a voice ends
+# up with a hundred near-identical lines and still no clip for the one it
+# needs.
+#
+# So a phrase is split into sentences and each is spoken by whichever
+# voice actually has it: the cloned voice for the part that repeats, the
+# Windows voice for the part that never does.
+_SEGMENT_PATTERN = re.compile(r"[^.!?]+[.!?]?")
+
+# Durations and distances. Deliberately narrow: "Area 18" and "HUR-L5"
+# contain digits and are perfectly renderable, so "has a number in it" is
+# far too blunt a test.
+_VARIABLE_PATTERN = re.compile(
+    r"\b\d[\d.,]*\s*(?:second|minute|hour|day|km|gm|mm|kilometre|"
+    r"kilometer|meter|metre)s?\b",
+    re.IGNORECASE,
+)
+
+
+def split_segments(text):
+    """Split a phrase into sentences, keeping their punctuation."""
+    return [
+        part.strip() for part in _SEGMENT_PATTERN.findall(str(text))
+        if part.strip()
+    ]
+
+
+def is_variable(text):
+    """True when this sentence carries a value that changes every time.
+
+    Such a sentence is never rendered and never logged as missing: it
+    would be a clip used once, and a to-do list that never empties.
+    """
+    return bool(_VARIABLE_PATTERN.search(str(text)))
+
+
 def slugify(name):
     """Folder-safe name. Two voices cannot collide by accident."""
     slug = re.sub(r"[^a-z0-9]+", "-", str(name).strip().lower()).strip("-")
@@ -194,7 +235,7 @@ class Voice:
     def note_miss(self, text):
         """Record a line spoken without a clip. Never raises."""
         text = " ".join(str(text).split())
-        if not text or self.has(text):
+        if not text or self.has(text) or is_variable(text):
             return
         try:
             misses = self._read_misses()
@@ -421,7 +462,7 @@ def dedupe(lines):
         if text is None:
             continue
         text = str(text).strip()
-        if not text:
+        if not text or is_variable(text):
             continue
         key = line_key(text)
         if key in seen:

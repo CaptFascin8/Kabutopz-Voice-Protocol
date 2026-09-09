@@ -317,6 +317,34 @@ def _key(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
 
 
+# Characters OCR routinely confuses with each other. Reading a screen is
+# not reading a file: "HUR-L1 GREEN GLADE" came back with the 1 as an l,
+# so "hurl1" was not found inside "hurllgreenglade" and a row that was
+# plainly on screen was reported missing. HUR-L5 worked, because 5 has no
+# look-alike.
+# Kept deliberately short. Every extra pair widens what can match by
+# accident, and these three are the ones that actually bite on this HUD.
+_CONFUSABLE = str.maketrans({
+    "i": "1", "l": "1", "|": "1", "!": "1",
+    "o": "0",
+    "s": "5",
+})
+
+
+def _loose_key(text):
+    """A key with OCR look-alikes folded together.
+
+    Folding happens *before* the non-alphanumeric strip, so a "1" read as
+    "!" is still rescued — stripping first would throw the character away
+    and lose the very case this exists for.
+
+    Only ever used as a fallback after the strict key fails, so it cannot
+    make an ordinary match worse; it can only rescue one the strict
+    comparison lost to a mis-read character.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(text).lower().translate(_CONFUSABLE))
+
+
 def _similar(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio()
 
@@ -431,6 +459,7 @@ def pick_row(rows, destination, current_system, min_similarity=0.72):
     if not target:
         return None, "no destination given"
 
+    loose_target = _loose_key(destination)
     system_key = _key(current_system or "")
     scored = []
 
@@ -443,6 +472,10 @@ def pick_row(rows, destination, current_system, min_similarity=0.72):
             match_score, how = 100, "exact"
         elif target in row_key or row_key in target:
             match_score, how = 70, "partial"
+        elif (loose_target in _loose_key(row["text"])
+              or _loose_key(row["text"]) in loose_target):
+            # Same match, made through a mis-read character.
+            match_score, how = 65, "partial (OCR look-alike)"
         else:
             ratio = _similar(row_key, target)
             if ratio < min_similarity:

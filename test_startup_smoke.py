@@ -475,12 +475,28 @@ try:
         app._speak = mod.VoiceKeybindApp._speak.__get__(app)
         app.active_voice = _vc.find_voice(app_dir, "ship-computer")
         app.active_voice.clear_misses()
+        # Speech is sequenced on a worker thread now, so give it a moment.
         app._speak("Voice calibrated.", force=True)
+        _t.sleep(0.4)
         good = len(played) == 1
         print(f"{'PASS' if good else 'FAIL'}  a rendered line plays from the clone")
         if not good: failures.append("clone clip not played")
 
+        # A variable part must go to Windows and never be logged, while the
+        # sentence beside it still comes from the clone.
+        played.clear()
+        app._speak("Voice calibrated. 1 minute, 23 seconds.", force=True)
+        _t.sleep(0.6)
+        good = len(played) == 1
+        print(f"{'PASS' if good else 'FAIL'}  mixed line: clone speaks 1 part, Windows the time")
+        if not good: failures.append(f"segmented speech played {len(played)}")
+
+        good = not any("minute" in m for m in app.active_voice.logged_misses())
+        print(f"{'PASS' if good else 'FAIL'}  a travel time is never logged for rendering")
+        if not good: failures.append("variable line logged")
+
         app._speak("Docking clamps released.", force=True)
+        _t.sleep(0.4)
         misses = app.active_voice.logged_misses()
         good = misses == ["Docking clamps released."]
         print(f"{'PASS' if good else 'FAIL'}  an unrendered line is logged: {misses}")
@@ -488,6 +504,25 @@ try:
     finally:
         _vc.play = real_play
         app._speak = lambda text="", force=False: None
+
+    # Deleting one bad clip must put exactly that line back on the pending
+    # list — the alternative is re-rendering 154 lines to fix one.
+    v = app.active_voice
+    before = len(v.pending(app._voice_catalog()))
+    v.clip_for("Voice calibrated.").unlink()
+    after = len(v.pending(app._voice_catalog()))
+    good = after == before + 1 and not v.has("Voice calibrated.")
+    print(f"{'PASS' if good else 'FAIL'}  removing one clip queues exactly that line ({before} -> {after})")
+    if not good: failures.append("re-render queue")
+
+    good = app._pending_line_count() == after
+    print(f"{'PASS' if good else 'FAIL'}  the close prompt would offer {after} line(s)")
+    if not good: failures.append("pending count")
+
+    app.active_voice = None
+    good = app._pending_line_count() == 0
+    print(f"{'PASS' if good else 'FAIL'}  no cloned voice means no close prompt")
+    if not good: failures.append("pending count with no voice")
 
     # The catalogue must include the pilot's own replies.
     cat = app._voice_catalog()

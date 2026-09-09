@@ -2669,6 +2669,7 @@ class VoiceKeybindApp(tk.Tk):
             ("USE THIS VOICE", self._use_selected_voice, "accent"),
             ("TEST", self._test_selected_voice, "panel2"),
             ("RENDER MISSING LINES", self._render_selected_voice, "panel2"),
+            ("REVIEW LINES", self._review_voice_lines, "panel2"),
             ("DELETE", self._delete_selected_voice, "red"),
         ):
             if colour == "accent":
@@ -2835,6 +2836,114 @@ class VoiceKeybindApp(tk.Tk):
         voice_clones.delete_voice(APP_DIR, voice.slug)
         self._history_add(f"Deleted the {voice.name} voice.")
         self._refresh_voice_clones()
+
+    def _review_voice_lines(self):
+        """List a voice's rendered lines so a bad one can be re-done.
+
+        Chatterbox occasionally produces a garbled take — one line came out
+        as noise where "Standing by." should have been. Without this the
+        only remedy is deleting the whole voice and re-rendering all 154
+        lines to fix one. Deleting a single clip puts that line back on the
+        pending list, and RENDER MISSING LINES redoes just that one.
+        """
+        voice = self._selected_voice()
+        if voice is None:
+            messagebox.showinfo(
+                "Voice Clones", "Pick a cloned voice to review."
+            )
+            return
+
+        catalog = self._voice_catalog()
+        rendered = [text for text in catalog if voice.has(text)]
+        if not rendered:
+            messagebox.showinfo(
+                "Voice Clones", f"{voice.name} has no rendered lines yet."
+            )
+            return
+
+        t = self.theme
+        window = tk.Toplevel(self)
+        window.title(f"{voice.name} — rendered lines")
+        window.configure(bg=t["panel"])
+        window.geometry("760x520")
+        window.transient(self)
+
+        tk.Label(
+            window,
+            text=f"{len(rendered)} lines. Select one to hear it; re-render "
+                 f"any that came out wrong.",
+            bg=t["panel"], fg=t["muted"], font=("Segoe UI", 9),
+            wraplength=720, justify="left",
+        ).pack(anchor="w", padx=18, pady=(16, 8))
+
+        listbox = tk.Listbox(
+            window,
+            bg=t["panel2"], fg=t["text"],
+            selectbackground=t["border"], selectforeground=t["text"],
+            relief="flat", bd=0, activestyle="none",
+            font=("Cascadia Mono", 9), highlightthickness=0,
+        )
+        listbox.pack(fill="both", expand=True, padx=18)
+        for text in rendered:
+            listbox.insert(tk.END, text)
+
+        def selected_text():
+            selection = listbox.curselection()
+            return rendered[selection[0]] if selection else None
+
+        def play_selected():
+            text = selected_text()
+            if text is None:
+                return
+            clip = voice.clip_for(text)
+            if clip:
+                voice_clones.stop()
+                voice_clones.play(clip)
+
+        def redo_selected():
+            text = selected_text()
+            if text is None:
+                return
+            clip = voice.clip_for(text)
+            if clip is None:
+                return
+            try:
+                clip.unlink()
+            except Exception as exc:
+                messagebox.showerror("Voice Clones", f"Could not remove it.\n\n{exc}")
+                return
+            listbox.delete(listbox.curselection()[0])
+            rendered.remove(text)
+            self._history_add(f'Marked for re-render: "{text}"')
+            self._refresh_voice_clones()
+
+        listbox.bind("<Double-Button-1>", lambda _e: play_selected())
+
+        buttons = tk.Frame(window, bg=t["panel"])
+        buttons.pack(fill="x", padx=18, pady=14)
+        for label, command, accent in (
+            ("PLAY", play_selected, True),
+            ("RE-RENDER THIS LINE", redo_selected, False),
+            ("RENDER THEM NOW", lambda: (window.destroy(),
+                                         self._render_voice(voice)), False),
+            ("CLOSE", window.destroy, False),
+        ):
+            bg = t["accent"] if accent else t["panel2"]
+            fg = self._accent_text_color(t["accent"]) if accent else t["text"]
+            tk.Button(
+                buttons, text=label, command=command,
+                bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+                relief="flat", bd=0, font=("Segoe UI", 8, "bold"), pady=7,
+            ).pack(side="left", fill="x", expand=True, padx=3)
+
+    def _pending_line_count(self):
+        """How many lines the active voice still needs. 0 when none."""
+        if self.active_voice is None:
+            return 0
+        try:
+            return len(self.active_voice.pending(self._voice_catalog()))
+        except Exception:
+            return 0
 
     # ---- getting a reference recording ----------------------------------
     def _record_voice_reference(self):
@@ -5505,6 +5614,32 @@ class VoiceKeybindApp(tk.Tk):
         self._save_settings()
 
     # ---- cloned voices --------------------------------------------------
+    def _speak_segments(self, voice, segments):
+        """Speak each sentence with whichever voice has it.
+
+        Sequenced on a worker thread rather than fired all at once:
+        winsound has no completion callback, so the clip's own length is
+        used to wait it out. Overlapping a cloned clip with a Windows
+        sentence would be worse than either alone.
+        """
+        def worker():
+            self._stop_tts()
+            voice_clones.stop()
+
+            for part in segments:
+                clip = voice.clip_for(part)
+                if clip is not None:
+                    if voice_clones.play(clip):
+                        seconds = voice_clones.wav_duration(clip) or 0.0
+                        time.sleep(seconds + 0.05)
+                        continue
+                if not voice_clones.is_variable(part):
+                    voice.note_miss(part)
+                self._speak_windows(part, wait=True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
     def _load_active_voice(self):
         """Resolve the saved active voice, or None for the Windows voice."""
         slug = str(self.settings.get("active_voice", "") or "").strip()
@@ -5775,29 +5910,40 @@ class VoiceKeybindApp(tk.Tk):
         if not force and not self.voice_feedback_var.get():
             return
 
-        # A cloned voice, when one is active and has this line rendered.
-        # Playing a file costs nothing and cannot stutter, which is the
-        # whole reason every line is rendered up front.
+        # A cloned voice, when one is active. Speech is split into
+        # sentences and each is spoken by whichever voice actually has it:
+        # "Course set to Grim Hex." from the clone, "1 minute, 23 seconds."
+        # from Windows. Rendering the pair would be pointless — the travel
+        # time is different every flight, so the clip would be used once
+        # and never match again.
         voice = self.active_voice
         if voice is not None:
-            clip = voice.clip_for(phrase)
-            if clip is not None:
-                self._stop_tts()
-                voice_clones.stop()
-                if voice_clones.play(clip):
-                    return
-            else:
-                # Write down what we could not say, so the VOICE CLONES
-                # page can offer to render exactly the lines that came up
-                # rather than asking the pilot to guess.
-                voice.note_miss(phrase)
+            segments = voice_clones.split_segments(phrase)
+            if any(voice.clip_for(part) for part in segments):
+                self._speak_segments(voice, segments)
+                return
+            for part in segments:
+                # Written down so the page can offer to render exactly
+                # what came up. Variable lines are skipped inside
+                # note_miss — a to-do list that never empties is worse
+                # than none.
+                voice.note_miss(part)
 
+        self._speak_windows(phrase)
+
+    def _speak_windows(self, text, wait=False):
+        """Say something with the Windows voice.
+
+        Split out of _speak so the segment player can use it for the parts
+        a cloned voice has no clip for, and can wait for each sentence
+        instead of letting them overlap.
+        """
         def worker():
             # New speech interrupts old speech so answers do not pile up.
             self._stop_tts()
 
             try:
-                safe_phrase = phrase.replace("'", "''")
+                safe_phrase = text.replace("'", "''")
                 volume = max(0, min(100, int(self.tts_volume_var.get())))
                 voice = self.tts_voice_var.get().strip()
                 safe_voice = voice.replace("'", "''")
@@ -5839,8 +5985,10 @@ class VoiceKeybindApp(tk.Tk):
             except Exception:
                 pass
 
-        threading.Thread(target=worker, daemon=True).start()
-
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        if wait:
+            thread.join(timeout=30)
 
     def _extract_keybind_question(self, heard):
         """
@@ -6954,6 +7102,29 @@ class VoiceKeybindApp(tk.Tk):
             )
 
     def on_close(self):
+        # A last chance to catch up on lines the voice picked up while
+        # flying — a destination nobody anticipated, a reply just typed
+        # in. Closing is the natural moment for it, because it is exactly
+        # when the graphics card is free.
+        try:
+            pending = self._pending_line_count()
+            if pending and self._voice_forge_python() is not None:
+                answer = messagebox.askyesnocancel(
+                    "Voice Clones",
+                    f"{self.active_voice.name} has {pending} line(s) not yet "
+                    f"in your voice.\n\nRender them now?\n\n"
+                    f"Yes renders and keeps the app open. No closes anyway — "
+                    f"they will still be waiting next time."
+                )
+                if answer is None:
+                    return
+                if answer:
+                    self.show_page("VOICE CLONES")
+                    self._render_voice(self.active_voice)
+                    return
+        except Exception:
+            pass
+
         self.running = False
         self.repeats.stop_all(announce=False)
         if self.voice_toggle_hotkey is not None:
